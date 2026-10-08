@@ -1,4 +1,4 @@
-name: Paper 1.8.8 (bore.pub)
+name: Paper 1.8.8 (bore.pub) with Pterodactyl Panel
 
 on:
   workflow_dispatch:
@@ -18,7 +18,6 @@ jobs:
       - name: Download Paper 1.8.8 Build 445
         run: |
           wget -O paper.jar https://fill-data.papermc.io/v1/objects/7ff6d2cec671ef0d95b3723b5c92890118fb882d73b7f8fa0a2cd31d97c55f86/paper-1.8.8-445.jar
-
       - name: Accept Minecraft EULA
         run: echo "eula=true" > eula.txt
 
@@ -27,34 +26,23 @@ jobs:
           wget -q https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
           tar xzf bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
           chmod +x bore
-
           ./bore local 25565 --to bore.pub > bore.log 2>&1 &
           sleep 8
-
           echo "----- raw bore output -----"
           cat bore.log
           echo "---------------------------"
-
-          # Strip ANSI escape codes -> plain text
           sed 's/\x1b\[[0-9;]*m//g' bore.log > bore.clean.log
-
           echo "----- clean bore output -----"
           cat bore.clean.log
           echo "-----------------------------"
-
-          # Extract port from "listening at bore.pub:58580"
           PUBLIC_PORT=$(grep -oP 'listening at bore\.pub:\K[0-9]+' bore.clean.log | head -1)
-
-          # Fallback: parse "remote_port=58580"
           if [ -z "$PUBLIC_PORT" ]; then
             PUBLIC_PORT=$(grep -oP 'remote_port=\K[0-9]+' bore.clean.log | head -1)
           fi
-
           if [ -z "$PUBLIC_PORT" ]; then
             echo "ERROR: could not extract bore public port."
             exit 1
           fi
-
           echo "========================================================="
           echo "SERVER ADDRESS: bore.pub:$PUBLIC_PORT"
           echo "========================================================="
@@ -62,6 +50,42 @@ jobs:
           echo "  Server Address: bore.pub"
           echo "  Port:           $PUBLIC_PORT"
           echo "========================================================="
+
+      - name: Install Dependencies (PHP, MariaDB, Nginx)
+        run: |
+          sudo apt update
+          sudo apt install -y software-properties-common curl apt-transport-https ca-certificates
+          sudo LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php
+          sudo apt update
+          sudo apt install -y php8.1 php8.1-{cli,gd,mysql,mbstring,bcmath,xml,fpm,curl,zip} mariadb-server nginx tar unzip git redis-server
+
+      - name: Start MariaDB and Redis
+        run: |
+          sudo systemctl start mariadb
+          sudo systemctl start redis-server
+
+      - name: Install Pterodactyl Panel
+        run: |
+          bash <(curl -s https://raw.githubusercontent.com/pterodactyl-installer/pterodactyl-installer/master/install.sh) --panel --no-wings
+
+      - name: Start Cloudflare Quick Tunnel for Pterodactyl Panel
+        run: |
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared-linux-amd64.deb
+          cloudflared tunnel --url http://localhost:80 > cloudflared.log 2>&1 &
+          sleep 10
+          echo "----- Cloudflare Tunnel Output -----"
+          cat cloudflared.log
+          echo "------------------------------------"
+          PANEL_URL=$(grep -oP 'https://\K[a-z0-9-]+\.trycloudflare\.com' cloudflared.log | head -1)
+          if [ -z "$PANEL_URL" ]; then
+            echo "ERROR: Could not extract cloudflared URL."
+            exit 1
+          fi
+          echo "========================================================="
+          echo "PTERODACTYL PANEL URL: $PANEL_URL"
+          echo "========================================================="
+          echo "Use this URL to access your Pterodactyl Panel."
 
       - name: Start Paper Server
         run: java -Xms2G -Xmx2G -jar paper.jar nogui
