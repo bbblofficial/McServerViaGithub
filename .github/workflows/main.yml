@@ -15,10 +15,14 @@ on:
         description: "RAM for Minecraft server in MB"
         type: string
         default: "2048"
+      op_player:
+        description: "Player to OP automatically (empty = nobody)"
+        type: string
+        default: "muvixo"
       tunnel:
-        description: "auto = bore > openport > serveo > pinggy | bore = bore.pub (open source) | openport = openport.io (open-source client) | serveo / pinggy = free SSH services (closed servers). Panel needs bore or auto."
+        description: "auto = bore > pinggy | bore = bore.pub (open source) | pinggy = free SSH service | playit = open-source agent, you claim it with a free account (not in auto). Panel needs bore or auto."
         type: choice
-        options: [auto, bore, openport, serveo, pinggy]
+        options: [auto, bore, pinggy, playit]
         default: auto
       mc_port:
         description: "Preferred public port (bore only; others pick their own and print it in the log)"
@@ -42,6 +46,7 @@ env:
   REQ_PANEL_PORT: ${{ inputs.panel_port }}
   REQ_WINGS_PORT: ${{ inputs.wings_port }}
   REQ_RAM_MB: ${{ inputs.ram_mb }}
+  OP_PLAYER: ${{ inputs.op_player }}
 
 jobs:
   run-server:
@@ -59,6 +64,9 @@ jobs:
         echo "PANEL_PASS=$PW" >> "$GITHUB_ENV"
         if [ "${{ inputs.with_panel }}" = "true" ] && [ "${{ inputs.tunnel }}" != "bore" ] && [ "${{ inputs.tunnel }}" != "auto" ]; then
           echo "::error::with_panel only works with tunnel=bore or tunnel=auto."; exit 1
+        fi
+        if ! [[ "$OP_PLAYER" =~ ^[A-Za-z0-9_]{0,16}$ ]]; then
+          echo "::error::op_player must be a valid Minecraft name (letters, digits, underscore, max 16)."; exit 1
         fi
 
         # keep RAM inside what a hosted runner can really give
@@ -78,7 +86,7 @@ jobs:
         echo "Firewall opened."
 
     # ------------------------------------------------------------
-    # 1. public TCP tunnel (bore / openport / serveo / pinggy / auto)
+    # 1. public TCP tunnel (bore / pinggy / playit / auto)
     # ------------------------------------------------------------
     - name: Start tunnel
       run: |
@@ -102,22 +110,9 @@ jobs:
         done
         EOF
 
-        cat > serveo_sup.sh << 'EOF'
-        #!/bin/bash
-        # usage: serveo_sup.sh REMOTE_PORT   (0 = let serveo choose)
-        while true; do
-          tail -f /dev/null | ssh -T \
-            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
-            -o ExitOnForwardFailure=yes -o ConnectTimeout=15 \
-            -R "$1:localhost:25565" serveo.net >> /tmp/serveo.log 2>&1
-          echo "$(date -u) serveo exited, restarting in 20s" >> /tmp/serveo.log
-          sleep 20
-        done
-        EOF
-
         cat > pinggy_sup.sh << 'EOF'
         #!/bin/bash
+        # free pinggy tunnels time out after ~60 min: reconnect (address may change)
         while true; do
           tail -f /dev/null | ssh -T -p 443 \
             -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
@@ -128,7 +123,7 @@ jobs:
           sleep 20
         done
         EOF
-        chmod +x bore_sup.sh serveo_sup.sh pinggy_sup.sh
+        chmod +x bore_sup.sh pinggy_sup.sh
 
         # open_port NAME LOCAL|same PREFERRED_PORT -> prints the port actually obtained
         open_port() {
@@ -175,56 +170,6 @@ jobs:
           return 0
         }
 
-        # ---------- openport (real open-source client from openport.io) ----------
-        try_openport() {
-          local i
-          if ! command -v openport > /dev/null 2>&1; then
-            wget -q -O /tmp/openport.deb https://openport.io/download/debian64/latest.deb || { echo "openport: download failed"; return 1; }
-            sudo dpkg -i /tmp/openport.deb > /tmp/openport_install.log 2>&1 || sudo apt-get install -f -y >> /tmp/openport_install.log 2>&1 || { echo "openport: install failed"; cat /tmp/openport_install.log; return 1; }
-          fi
-          command -v openport > /dev/null 2>&1 || { echo "openport: binary not found after install"; cat /tmp/openport_install.log 2>/dev/null || true; return 1; }
-          : > /tmp/openport.log
-          nohup openport 25565 > /tmp/openport.log 2>&1 &
-          for i in $(seq 1 45); do
-            ADDR=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/openport.log | grep -oE 'remote port [A-Za-z0-9.-]+:[0-9]{2,5}' | grep -oE '[A-Za-z0-9.-]+:[0-9]{2,5}$' | head -1 || true)
-            [ -n "$ADDR" ] && return 0
-            sleep 1
-          done
-          echo "openport: no address. Log:"; cat /tmp/openport.log || true
-          pkill -f "openport 25565" 2>/dev/null || true
-          return 1
-        }
-
-        # ---------- serveo ----------
-        stop_serveo() {
-          pkill -f serveo_sup.sh 2>/dev/null || true
-          pkill -f "serveo.net" 2>/dev/null || true
-          pkill -x tail 2>/dev/null || true
-        }
-        serveo_once() {
-          local P=$1 i
-          : > /tmp/serveo.log
-          nohup ./serveo_sup.sh "$P" > /dev/null 2>&1 &
-          for i in $(seq 1 25); do
-            ADDR=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/serveo.log | grep -oE 'serveo\.net:[0-9]{2,5}' | head -1 || true)
-            [ -n "$ADDR" ] && return 0
-            grep -qE 'forwarding failed|timed out|refused|Permission denied' /tmp/serveo.log && break
-            sleep 1
-          done
-          echo "serveo (-R $P) failed. Log:"; cat /tmp/serveo.log || true
-          stop_serveo
-          return 1
-        }
-        try_serveo() {
-          if ! timeout 10 bash -c 'cat < /dev/null > /dev/tcp/serveo.net/22' 2>/dev/null; then
-            echo "serveo.net:22 is not reachable (service down?)"; return 1
-          fi
-          serveo_once 0 && return 0
-          sleep 15
-          serveo_once "$REQ_MC_PORT" && return 0
-          return 1
-        }
-
         # ---------- pinggy ----------
         try_pinggy() {
           local i
@@ -242,21 +187,39 @@ jobs:
           return 1
         }
 
+        # ---------- playit (open-source agent; you claim it once with a free account) ----------
+        try_playit() {
+          local i LINK SHOWN=""
+          curl -fsSL -o playit https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-linux-amd64 || { echo "playit: download failed"; return 1; }
+          chmod +x playit
+          : > /tmp/playit.log
+          nohup ./playit --stdout > /tmp/playit.log 2>&1 &
+          echo "=== PLAYIT: open the claim link printed below, log in, then create a 'Minecraft Java' tunnel to 127.0.0.1:25565 ==="
+          for i in $(seq 1 120); do
+            LINK=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/playit.log | grep -oE 'https://playit\.gg/[^ ]+' | head -1 || true)
+            if [ -n "$LINK" ] && [ "$LINK" != "$SHOWN" ]; then echo "PLAYIT CLAIM LINK: $LINK"; SHOWN="$LINK"; fi
+            ADDR=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/playit.log | grep -oE '[A-Za-z0-9.-]+\.(joinmc\.link|ply\.gg)(:[0-9]+)?' | head -1 || true)
+            [ -n "$ADDR" ] && return 0
+            [ -n "$LINK" ] && { ADDR="(see your playit.gg dashboard > Tunnels for the address)"; return 0; }
+            sleep 1
+          done
+          echo "playit: no claim link or address. Log:"; cat /tmp/playit.log || true
+          pkill -f "playit --stdout" 2>/dev/null || true
+          return 1
+        }
+
         # ---------- run selected mode ----------
         OK=""
         if [ "$PANEL" = "true" ]; then
           try_bore && OK=1
         else
           case "$MODE" in
-            bore)     try_bore     && OK=1 ;;
-            openport) try_openport && OK=1 ;;
-            serveo)   try_serveo   && OK=1 ;;
-            pinggy)   try_pinggy   && OK=1 ;;
+            bore)   try_bore   && OK=1 ;;
+            pinggy) try_pinggy && OK=1 ;;
+            playit) try_playit && OK=1 ;;
             auto)
-              try_bore     && OK=1 || true
-              [ -n "$OK" ] || { echo ">> bore failed, trying openport"; try_openport && OK=1 || true; }
-              [ -n "$OK" ] || { echo ">> openport failed, trying serveo"; try_serveo && OK=1 || true; }
-              [ -n "$OK" ] || { echo ">> serveo failed, trying pinggy"; try_pinggy && OK=1 || true; }
+              try_bore   && OK=1 || true
+              [ -n "$OK" ] || { echo ">> bore failed, trying pinggy"; try_pinggy && OK=1 || true; }
               ;;
           esac
         fi
@@ -300,11 +263,15 @@ jobs:
       if: ${{ !inputs.with_panel }}
       run: |
         set -e
-        mkdir -p mc && cp paper.jar mc/paper.jar && cd mc
+        mkdir -p mc && cp paper.jar mc/paper.jar
+        # console input pipe, so we can send commands (op ...) to the server
+        rm -f mc.in; mkfifo mc.in
+        nohup sleep infinity <> mc.in > /dev/null 2>&1 &
+        cd mc
         echo "eula=true" > eula.txt
         echo "online-mode=${{ inputs.online_mode }}" > server.properties
         echo "server-port=25565" >> server.properties
-        nohup java -Xms512M -Xmx${MC_RAM}M -jar paper.jar nogui > ../server.log 2>&1 &
+        nohup java -Xms512M -Xmx${MC_RAM}M -jar paper.jar nogui < ../mc.in > ../server.log 2>&1 &
         echo $! > ../paper.pid
         for i in $(seq 1 90); do
           grep -q 'Done (' ../server.log && break
@@ -313,6 +280,13 @@ jobs:
         done
         grep -q 'Done (' ../server.log || { echo "::error::Paper did not finish starting"; tail -n 50 ../server.log; exit 1; }
         echo "Paper is up."
+
+        if [ -n "$OP_PLAYER" ]; then
+          echo "op $OP_PLAYER" > ../mc.in
+          sleep 5
+          echo "--- server answer to 'op $OP_PLAYER' ---"
+          tail -n 5 ../server.log
+        fi
 
     # ------------------------------------------------------------
     # 3B. Pterodactyl mode
@@ -501,6 +475,7 @@ jobs:
         SRV_UUID=$(echo "$SRV" | jq -r '.attributes.uuid')
         SRV_IDENT=$(echo "$SRV" | jq -r '.attributes.identifier')
         [ "$SRV_UUID" != "null" ] && [ -n "$SRV_UUID" ] || { echo "::error::server creation failed"; echo "$SRV" | jq .; exit 1; }
+        echo "SRV_IDENT=$SRV_IDENT" >> "$GITHUB_ENV"
 
         DIR="/var/lib/pterodactyl/volumes/$SRV_UUID"
         for i in $(seq 1 60); do [ -d "$DIR" ] && break; sleep 2; done
@@ -522,6 +497,31 @@ jobs:
         [ "$CODE" = "204" ] || { echo "::error::start failed (HTTP $CODE)"; cat /tmp/power.json; exit 1; }
         echo "Pterodactyl server started."
 
+    - name: Give OP (panel mode)
+      if: ${{ inputs.with_panel }}
+      run: |
+        set -e
+        [ -n "$OP_PLAYER" ] || { echo "op_player empty, skipping"; exit 0; }
+        STATE=""
+        for i in $(seq 1 60); do
+          STATE=$(curl -s "http://127.0.0.1/api/client/servers/$SRV_IDENT/resources" \
+            -H "Authorization: Bearer $CLIENT_KEY" -H "Accept: application/json" | jq -r '.attributes.current_state' 2>/dev/null || true)
+          [ "$STATE" = "running" ] && break
+          sleep 5
+        done
+        [ "$STATE" = "running" ] || { echo "::warning::server not running yet, could not OP $OP_PLAYER"; exit 0; }
+        sleep 45   # let Paper finish loading
+        CODE=""
+        for i in $(seq 1 10); do
+          CODE=$(curl -s -o /tmp/cmd.json -w "%{http_code}" -X POST \
+            "http://127.0.0.1/api/client/servers/$SRV_IDENT/command" \
+            -H "Authorization: Bearer $CLIENT_KEY" -H "Accept: application/json" \
+            -H "Content-Type: application/json" -d "{\"command\":\"op $OP_PLAYER\"}" || true)
+          [ "$CODE" = "204" ] && break
+          sleep 10
+        done
+        if [ "$CODE" = "204" ]; then echo "Sent: op $OP_PLAYER"; else echo "::warning::could not send op command (HTTP $CODE)"; cat /tmp/cmd.json || true; fi
+
     # ------------------------------------------------------------
     # 4. info + watchdog
     # ------------------------------------------------------------
@@ -529,6 +529,7 @@ jobs:
       run: |
         echo "========================================================="
         echo " MINECRAFT (1.8.8):  ${PUBLIC_ADDR}"
+        [ -z "$OP_PLAYER" ] || echo " OP:                 ${OP_PLAYER}"
         if [ "${{ inputs.with_panel }}" = "true" ]; then
           echo " PANEL:              http://${TUNNEL_HOST}:${PANEL_PORT}"
           echo " LOGIN:              admin@example.com / ${PANEL_PASS}"
@@ -537,25 +538,27 @@ jobs:
 
     - name: Keep alive (watchdog)
       run: |
-        LAST=""
+        LAST=""; LASTP=""
         while true; do
           if [ "${{ inputs.with_panel }}" != "true" ] && ! kill -0 "$(cat paper.pid)" 2>/dev/null; then
             echo "$(date -u) Paper stopped. Last log:"; tail -n 30 server.log
             exit 1
           fi
-          # free tunnels can reconnect on a new address: print the current one whenever it changes
-          CUR=""
+          # pinggy reconnects (free tunnels time out) and can change address: print it when it changes
           if [ -f /tmp/pinggy.log ]; then
-            C=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/pinggy.log | grep -oE 'tcp://[A-Za-z0-9.-]+:[0-9]{2,5}' | tail -1 | sed 's#tcp://##' || true)
-            [ -n "$C" ] && CUR="$C"
+            CUR=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/pinggy.log | grep -oE 'tcp://[A-Za-z0-9.-]+:[0-9]{2,5}' | tail -1 | sed 's#tcp://##' || true)
+            if [ -n "$CUR" ] && [ "$CUR" != "$LAST" ]; then
+              echo "$(date -u) CURRENT MINECRAFT ADDRESS: $CUR"
+              LAST="$CUR"
+            fi
           fi
-          if [ -f /tmp/openport.log ]; then
-            C=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/openport.log | grep -oE 'remote port [A-Za-z0-9.-]+:[0-9]{2,5}' | grep -oE '[A-Za-z0-9.-]+:[0-9]{2,5}$' | tail -1 || true)
-            [ -n "$C" ] && CUR="$C"
-          fi
-          if [ -n "$CUR" ] && [ "$CUR" != "$LAST" ]; then
-            echo "$(date -u) CURRENT MINECRAFT ADDRESS: $CUR"
-            LAST="$CUR"
+          # playit: show claim link / address lines from the agent log
+          if [ -f /tmp/playit.log ]; then
+            P=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/playit.log | grep -oE 'https://playit\.gg/[^ ]+|[A-Za-z0-9.-]+\.(joinmc\.link|ply\.gg)(:[0-9]+)?' | sort -u | tr '\n' ' ' || true)
+            if [ -n "$P" ] && [ "$P" != "$LASTP" ]; then
+              echo "$(date -u) PLAYIT INFO: $P"
+              LASTP="$P"
+            fi
           fi
           sleep 30
         done
