@@ -1,47 +1,88 @@
 name: Paper 1.8.8 (bore.pub) with Pterodactyl Panel + Custom Dashboard
+
 on: workflow_dispatch:
+
 jobs:
   run-server:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 360
+
     steps:
     - name: Setup Java 8
-      uses: actions/setup-java@v5
+      uses: actions/setup-java@v4
       with:
         distribution: temurin
         java-version: '8'
 
     - name: Download Paper 1.8.8 Build 445
       run: |
-        wget -O paper.jar https://fill-data.papermc.io/v1/objects/7ff6d2cec671ef0d95b3723b5c92890118fb882d73b7f8fa0a2cd31d97c55f86/paper-1.8.8-445.jar
+        set -e
+        URLS=(
+          "https://api.papermc.io/v2/projects/paper/versions/1.8.8/builds/445/downloads/paper-1.8.8-445.jar"
+          "https://fill-data.papermc.io/v1/objects/7ff6d2cec671ef0d95b3723b5c92890118fb882d73b7f8fa0a2cd31d97c55f86/paper-1.8.8-445.jar"
+        )
+        rm -f paper.jar
+        for u in "${URLS[@]}"; do
+          echo "Trying $u"
+          if wget -q -O paper.jar "$u" && [ -s paper.jar ]; then
+            echo "OK: $u"
+            break
+          fi
+        done
+        [ -s paper.jar ] || { echo "ERROR: could not download paper.jar"; exit 1; }
+        unzip -l paper.jar > /dev/null || { echo "ERROR: downloaded file is not a valid jar"; exit 1; }
+        ls -lh paper.jar
 
     - name: Accept Minecraft EULA
       run: echo "eula=true" > eula.txt
 
     - name: Start standalone Paper
       run: |
+        set -e
         nohup java -Xms512M -Xmx1G -jar paper.jar nogui > server.log 2>&1 &
+        echo $! > paper.pid
         sleep 3
+        if ! kill -0 "$(cat paper.pid)" 2>/dev/null; then
+          echo "ERROR: standalone Paper died on startup"; tail -n 50 server.log; exit 1
+        fi
         echo "Standalone Paper started (log: server.log)"
         echo "STANDALONE_WORKDIR=$PWD" >> "$GITHUB_ENV"
-        echo "JAVA_BIN=$(which java)" >> "$GITHUB_ENV"
+        echo "JAVA_BIN=$(readlink -f "$(which java)")" >> "$GITHUB_ENV"
 
     - name: Install bore and create TCP tunnels
       run: |
-        wget -q https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
-        tar xzf bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
+        set -e
+        BORE_VER=$(curl -fsSL https://api.github.com/repos/ekzhang/bore/releases/latest \
+                   | grep -oP '"tag_name":\s*"\K[^"]+' || true)
+        [ -z "$BORE_VER" ] && BORE_VER="v0.6.0"
+        echo "Using bore $BORE_VER"
+        wget -q "https://github.com/ekzhang/bore/releases/download/${BORE_VER}/bore-${BORE_VER}-x86_64-unknown-linux-musl.tar.gz"
+        tar xzf "bore-${BORE_VER}-x86_64-unknown-linux-musl.tar.gz"
         chmod +x bore
-        ./bore local 25565 --to bore.pub > bore.log 2>&1 &
+        ./bore local 25565 --to bore.pub > bore.log  2>&1 &
+        echo $! > bore1.pid
         ./bore local 25570 --to bore.pub > bore2.log 2>&1 &
-        sleep 8
+        echo $! > bore2.pid
+
         get_port() {
-          sed 's/\x1b\[[0-9;]*m//g' "$1" > "$1.clean"
+          sed 's/\x1b\[[0-9;]*m//g' "$1" > "$1.clean" 2>/dev/null || cp "$1" "$1.clean"
+          local P
           P=$(grep -oP 'listening at bore\.pub:\K[0-9]+' "$1.clean" | head -1)
-          [ -z "$P" ] && P=$(grep -oP 'remote_port=\K[0-9]+' "$1.clean" | head -1)
+          [ -z "$P" ] && P=$(grep -oP 'remote_port=\K[0-9]+'      "$1.clean" | head -1)
+          [ -z "$P" ] && P=$(grep -oP 'bore\.pub:\K[0-9]+'         "$1.clean" | head -1)
           echo "$P"
         }
-        PORT1=$(get_port bore.log)
-        PORT2=$(get_port bore2.log)
+
+        PORT1=""; PORT2=""
+        for i in $(seq 1 30); do
+          PORT1=$(get_port bore.log)
+          PORT2=$(get_port bore2.log)
+          [ -n "$PORT1" ] && [ -n "$PORT2" ] && break
+          sleep 2
+        done
+        [ -n "$PORT1" ] || { echo "ERROR: could not determine tunnel 1 port";  cat bore.log;  exit 1; }
+        [ -n "$PORT2" ] || { echo "ERROR: could not determine tunnel 2 port";  cat bore2.log; exit 1; }
+
         echo "PORT1=$PORT1" >> "$GITHUB_ENV"
         echo "PORT2=$PORT2" >> "$GITHUB_ENV"
         echo "========================================================="
@@ -49,39 +90,46 @@ jobs:
         echo "MINECRAFT SERVER (Pterodactyl): bore.pub:$PORT2"
         echo "========================================================="
 
-    - name: Install Dependencies (PHP, MariaDB, Nginx)
+    - name: Install Dependencies (PHP, MariaDB, Nginx, redis, python-yaml)
       run: |
-        sudo apt update
-        sudo apt install -y software-properties-common curl apt-transport-https ca-certificates
+        set -e
+        sudo apt-get update
+        sudo apt-get install -y software-properties-common curl apt-transport-https ca-certificates
         sudo LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php
-        sudo apt update
-        sudo apt install -y php8.1 php8.1-{cli,gd,mysql,mbstring,bcmath,xml,fpm,curl,zip} mariadb-server nginx tar unzip git redis-server jq
+        sudo apt-get update
+        sudo apt-get install -y \
+          php8.1 php8.1-{cli,gd,mysql,mbstring,bcmath,xml,fpm,curl,zip} \
+          mariadb-server nginx tar unzip git redis-server jq expect \
+          python3-yaml
 
     - name: Start MariaDB and Redis
       run: |
         sudo systemctl start mariadb
         sudo systemctl start redis-server
+        sudo systemctl enable mariadb redis-server
 
     - name: Install Pterodactyl Panel (Automated via Expect)
       run: |
-        sudo apt-get install -y expect
+        set -e
         cat << 'EOF' > install_panel.exp
         set timeout 1800
-        spawn sudo bash -c "curl -s https://raw.githubusercontent.com/pterodactyl-installer/pterodactyl-installer/master/install.sh > /tmp/install.sh && bash /tmp/install.sh"
+        spawn sudo bash -c "curl -fsSL https://raw.githubusercontent.com/pterodactyl-installer/pterodactyl-installer/master/install.sh -o /tmp/install.sh && bash /tmp/install.sh"
         expect {
             timeout { puts "TIMEOUT"; exit 1 }
             -re {Input 0-6:}                                                    { send "0\r"; exp_continue }
-            -re {Database name \(panel\):}                                      { send "\r"; exp_continue }
-            -re {Database username \(pterodactyl\):}                            { send "\r"; exp_continue }
-            -re {Password \(press enter to use randomly generated password\):}  { send "\r"; exp_continue }
+            -re {Database name \(panel\):}                                      { send "\r";  exp_continue }
+            -re {Database username \(pterodactyl\):}                            { send "\r";  exp_continue }
+            -re {Password \(press enter to use randomly generated password\):}  { send "\r";  exp_continue }
             -re {Select timezone \[[^\]]*\]:}                                   { send "UTC\r"; exp_continue }
             -re {Provide the email address that will be used to configure}      { send "admin@example.com\r"; exp_continue }
             -re {Email address for the initial admin account:}                  { send "admin@example.com\r"; exp_continue }
             -re {Username for the initial admin account:}                       { send "admin\r"; exp_continue }
             -re {First name for the initial admin account:}                     { send "Admin\r"; exp_continue }
-            -re {Last name for the initial admin account:}                      { send "User\r"; exp_continue }
+            -re {Last name for the initial admin account:}                      { send "User\r";  exp_continue }
             -re {Password for the initial admin account:}                       { send "AdminPassword123!\r"; exp_continue }
             -re {Set the FQDN of this panel}                                    { send "127.0.0.1\r"; exp_continue }
+            -re {(?i)Let'?s Encrypt.*\(y/N\):}                                  { send "n\r"; exp_continue }
+            -re {(?i)automatically configure.*HTTPS.*\(y/N\):}                  { send "n\r"; exp_continue }
             -re {configure UFW \(firewall\)\? \(y/N\):}                         { send "N\r"; exp_continue }
             -re {anonymous telemetry data\? \(yes/no\) \[yes\]:}                { send "no\r"; exp_continue }
             -re {Continue with installation\? \(y/N\):}                         { send "y\r"; exp_continue }
@@ -90,19 +138,39 @@ jobs:
         EOF
         expect install_panel.exp
         test -f /var/www/pterodactyl/.env || { echo "ERROR: panel .env missing, install failed"; exit 1; }
+        echo "Panel install OK"
+
+    - name: Fix Nginx to accept any Host header (needed for the Cloudflare tunnel)
+      run: |
+        set -e
+        sudo rm -f /etc/nginx/sites-enabled/default || true
+        CONF=""
+        for f in /etc/nginx/sites-available/pterodactyl.conf \
+                 /etc/nginx/sites-available/pterodactyl; do
+          if [ -f "$f" ]; then CONF="$f"; break; fi
+        done
+        if [ -n "$CONF" ]; then
+          sudo sed -i -E 's/^([[:space:]]*server_name[[:space:]]+).*;/\1_;/' "$CONF"
+          echo "Patched $CONF"
+          grep -n "server_name" "$CONF" || true
+        fi
+        sudo nginx -t
+        sudo systemctl reload nginx
 
     - name: Start Cloudflare Quick Tunnel for Pterodactyl Panel
       run: |
+        set -e
         wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
         sudo dpkg -i cloudflared-linux-amd64.deb
-        cloudflared tunnel --url http://localhost:80 > cloudflared.log 2>&1 &
+        nohup cloudflared tunnel --url http://localhost:80 > cloudflared.log 2>&1 &
         PANEL_URL=""
-        for i in $(seq 1 30); do
-          PANEL_URL=$(grep -oP 'https://\K(?!api\.)[a-z0-9-]+\.trycloudflare\.com' cloudflared.log | head -1 || true)
+        for i in $(seq 1 45); do
+          PANEL_URL=$(grep -oP 'https://\K[a-z0-9-]+\.trycloudflare\.com' cloudflared.log | head -1 || true)
           [ -n "$PANEL_URL" ] && break
           sleep 2
         done
         [ -z "$PANEL_URL" ] && { echo "ERROR: no cloudflared URL"; cat cloudflared.log; exit 1; }
+
         sudo sed -i "s|^APP_URL=.*|APP_URL=https://$PANEL_URL|" /var/www/pterodactyl/.env
         grep -q '^TRUSTED_PROXIES=' /var/www/pterodactyl/.env \
           && sudo sed -i "s|^TRUSTED_PROXIES=.*|TRUSTED_PROXIES=*|" /var/www/pterodactyl/.env \
@@ -110,13 +178,19 @@ jobs:
         grep -q '^APP_CORS_ALLOWED_ORIGINS=' /var/www/pterodactyl/.env \
           && sudo sed -i "s|^APP_CORS_ALLOWED_ORIGINS=.*|APP_CORS_ALLOWED_ORIGINS=*|" /var/www/pterodactyl/.env \
           || echo 'APP_CORS_ALLOWED_ORIGINS=*' | sudo tee -a /var/www/pterodactyl/.env > /dev/null
+        grep -q '^SESSION_SECURE_COOKIE=' /var/www/pterodactyl/.env \
+          && sudo sed -i "s|^SESSION_SECURE_COOKIE=.*|SESSION_SECURE_COOKIE=true|" /var/www/pterodactyl/.env \
+          || echo 'SESSION_SECURE_COOKIE=true' | sudo tee -a /var/www/pterodactyl/.env > /dev/null
+
         cd /var/www/pterodactyl && sudo -u www-data php artisan optimize:clear
+
         echo "$PANEL_URL" > /tmp/panel_url.txt
         echo "PANEL_URL=$PANEL_URL" >> "$GITHUB_ENV"
         echo "PANEL URL: https://$PANEL_URL"
 
     - name: Install Docker and Wings
       run: |
+        set -e
         if ! command -v docker > /dev/null 2>&1; then
           curl -fsSL https://get.docker.com | sudo sh
         fi
@@ -169,24 +243,29 @@ jobs:
             exit(1);
         }
         PHP
+
         cd /var/www/pterodactyl
         set +e
         sudo -u www-data php -d display_errors=stderr /tmp/mk-apikey.php > /tmp/mk-apikey.out 2> /tmp/mk-apikey.err
         RC=$?
         set -e
+
         API_KEY=$(sed -n '1p' /tmp/mk-apikey.out)
         CLIENT_KEY=$(sed -n '2p' /tmp/mk-apikey.out)
+
         if [ "$RC" -ne 0 ] || [ -z "$API_KEY" ] || [ -z "$CLIENT_KEY" ]; then
           echo "ERROR: could not generate API keys (exit code $RC)"
           echo "----- stderr -----"; cat /tmp/mk-apikey.err || true
           echo "----- stdout -----"; cat /tmp/mk-apikey.out || true
           exit 1
         fi
+
         sudo rm -f /tmp/mk-apikey.php /tmp/mk-apikey.out
         echo "::add-mask::$API_KEY"
         echo "::add-mask::$CLIENT_KEY"
-        echo "API_KEY=$API_KEY" >> "$GITHUB_ENV"
+        echo "API_KEY=$API_KEY"       >> "$GITHUB_ENV"
         echo "CLIENT_KEY=$CLIENT_KEY" >> "$GITHUB_ENV"
+
         CODE=$(curl -s -o /tmp/verify.json -w "%{http_code}" "http://127.0.0.1/api/application/locations" \
           -H "Authorization: Bearer $API_KEY" -H "Accept: application/json")
         echo "Application API check: HTTP $CODE"
@@ -198,23 +277,28 @@ jobs:
 
     - name: Create Location and Node
       run: |
-        cloudflared tunnel --url http://localhost:8080 > wings_cf.log 2>&1 &
+        set -e
+        nohup cloudflared tunnel --url http://localhost:8080 > wings_cf.log 2>&1 &
         WINGS_URL=""
-        for i in $(seq 1 30); do
-          WINGS_URL=$(grep -oP 'https://\K(?!api\.)[a-z0-9-]+\.trycloudflare\.com' wings_cf.log | head -1 || true)
+        for i in $(seq 1 45); do
+          WINGS_URL=$(grep -oP 'https://\K[a-z0-9-]+\.trycloudflare\.com' wings_cf.log | head -1 || true)
           [ -n "$WINGS_URL" ] && break
           sleep 2
         done
         [ -z "$WINGS_URL" ] && { echo "ERROR: no cloudflared URL for wings"; cat wings_cf.log; exit 1; }
         echo "WINGS URL: https://$WINGS_URL"
         echo "WINGS_URL=$WINGS_URL" >> "$GITHUB_ENV"
+
         H_AUTH="Authorization: Bearer $API_KEY"
         H_ACC="Accept: application/json"
         H_CT="Content-Type: application/json"
+
         LOC_RESP=$(curl -s -X POST "http://127.0.0.1/api/application/locations" \
           -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
           -d '{"short":"local","long":"Local"}')
         LOC_ID=$(echo "$LOC_RESP" | jq -r '.attributes.id')
+        [ "$LOC_ID" != "null" ] || { echo "ERROR creating location: $LOC_RESP"; exit 1; }
+
         NODE_RESP=$(curl -s -X POST "http://127.0.0.1/api/application/nodes" \
           -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
           -d "{
@@ -229,12 +313,30 @@ jobs:
             \"disk_overallocate\":0,
             \"upload_size\":100,
             \"daemon_sftp\":2022,
-            \"daemon_listen\":443
+            \"daemon_listen\":8080
           }")
         NODE_ID=$(echo "$NODE_RESP" | jq -r '.attributes.id')
+        [ "$NODE_ID" != "null" ] || { echo "ERROR creating node: $NODE_RESP"; exit 1; }
         echo "NODE_ID=$NODE_ID" >> "$GITHUB_ENV"
+
+        # NOTE: this endpoint returns YAML (Content-Type: text/plain), even with Accept: application/json
         curl -s "http://127.0.0.1/api/application/nodes/$NODE_ID/configuration" \
-          -H "$H_AUTH" -H "$H_ACC" > /tmp/wings-config.json
+          -H "$H_AUTH" -H "$H_ACC" > /tmp/wings-config.raw
+
+        if jq -e . /tmp/wings-config.raw > /dev/null 2>&1; then
+          cp /tmp/wings-config.raw /tmp/wings-config.json
+        else
+          python3 -c "
+        import json, yaml
+        with open('/tmp/wings-config.raw') as f:
+            data = yaml.safe_load(f)
+        with open('/tmp/wings-config.json','w') as f:
+            json.dump(data, f)
+        "
+        fi
+        jq . /tmp/wings-config.json > /dev/null
+        echo "Wings config (pre-modification):"
+        jq . /tmp/wings-config.json
 
     - name: Write Wings config and start Wings
       run: |
@@ -244,18 +346,25 @@ jobs:
             | .remote = "http://127.0.0.1"
             | .allowed_origins = ["*"]' \
           /tmp/wings-config.json | sudo tee /etc/pterodactyl/config.yml > /dev/null
+
+        echo "----- /etc/pterodactyl/config.yml -----"
+        sudo cat /etc/pterodactyl/config.yml
+
         sudo mkdir -p /var/lib/pterodactyl/volumes
         sudo chmod 600 /etc/pterodactyl/config.yml
+
         sudo nohup /usr/local/bin/wings --config /etc/pterodactyl/config.yml \
           > /tmp/wings.log 2>&1 &
         disown || true
+
         UP=0
         for i in $(seq 1 30); do
           CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/api/system || true)
           if [ "$CODE" = "200" ] || [ "$CODE" = "401" ]; then UP=1; break; fi
           sleep 2
         done
-        [ "$UP" = "1" ] || { echo "ERROR: Wings did not come up"; tail -n 40 /tmp/wings.log; exit 1; }
+        [ "$UP" = "1" ] || { echo "ERROR: Wings did not come up"; tail -n 60 /tmp/wings.log; exit 1; }
+        echo "Wings is up."
 
     - name: Create Allocation and Server via API
       run: |
@@ -263,17 +372,27 @@ jobs:
         H_AUTH="Authorization: Bearer $API_KEY"
         H_ACC="Accept: application/json"
         H_CT="Content-Type: application/json"
+
         curl -s -X POST "http://127.0.0.1/api/application/nodes/$NODE_ID/allocations" \
           -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
-          -d '{"ip":"0.0.0.0","ports":["25570"]}'
+          -d '{"ip":"0.0.0.0","ports":["25570"]}' > /dev/null
+
         ALLOC_ID=$(curl -s "http://127.0.0.1/api/application/nodes/$NODE_ID/allocations" \
           -H "$H_AUTH" -H "$H_ACC" | jq -r '.data[] | select(.attributes.port==25570) | .attributes.id' | head -1)
-        [ -n "$ALLOC_ID" ] || { echo "ERROR: no allocation"; exit 1; }
-        
+        [ -n "$ALLOC_ID" ] && [ "$ALLOC_ID" != "null" ] || { echo "ERROR: no allocation"; exit 1; }
+        echo "ALLOC_ID=$ALLOC_ID"
+
         EGG_ID=$(curl -s "http://127.0.0.1/api/application/nests/1/eggs" \
-          -H "$H_AUTH" -H "$H_ACC" | jq -r '.data[] | select(.attributes.name=="Paper") | .attributes.id')
-        [ -n "$EGG_ID" ] && [ "$EGG_ID" != "null" ] || { echo "ERROR: Paper egg not found"; exit 1; }
-        
+          -H "$H_AUTH" -H "$H_ACC" \
+          | jq -r '.data[] | select(.attributes.name=="Paper") | .attributes.id' | head -1)
+        if [ -z "$EGG_ID" ] || [ "$EGG_ID" = "null" ]; then
+          echo "Paper egg not found in nest 1, listing available:"
+          curl -s "http://127.0.0.1/api/application/nests/1/eggs" \
+            -H "$H_AUTH" -H "$H_ACC" | jq -r '.data[].attributes.name'
+          exit 1
+        fi
+        echo "EGG_ID=$EGG_ID"
+
         SRV_JSON=$(curl -s -X POST "http://127.0.0.1/api/application/servers" \
           -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
           -d "{
@@ -286,8 +405,8 @@ jobs:
             \"startup\":\"java -Xms128M -Xmx{{SERVER_MEMORY}}M -jar {{SERVER_JARFILE}}\",
             \"environment\":{
               \"SERVER_JARFILE\":\"server.jar\",
-              \"MINECRAFT_VERSION\":\"1.8.8\",
-              \"BUILD_NUMBER\":\"latest\",
+              \"MC_VERSION\":\"1.8.8\",
+              \"BUILD_NUMBER\":\"445\",
               \"DL_PATH\":\"\"
             },
             \"limits\":{\"memory\":2048,\"swap\":0,\"disk\":10240,\"io\":500,\"cpu\":200},
@@ -296,17 +415,15 @@ jobs:
             \"skip_scripts\":true,
             \"start_on_completion\":false
           }")
-          
-        SRV_UUID=$(echo "$SRV_JSON" | jq -r '.attributes.uuid')
+
+        SRV_UUID=$(echo "$SRV_JSON"  | jq -r '.attributes.uuid')
         SRV_IDENT=$(echo "$SRV_JSON" | jq -r '.attributes.identifier')
-        
-        if [ "$SRV_UUID" = "null" ] || [ -z "$SRV_UUID" ]; then
+        if [ "$SRV_UUID" = "null" ] || [ -z "$SRV_UUID" ] || [ "$SRV_UUID" = "" ]; then
           echo "ERROR: server creation failed. API Response:"
           echo "$SRV_JSON" | jq .
           exit 1
         fi
-        
-        echo "SRV_UUID=$SRV_UUID" >> "$GITHUB_ENV"
+        echo "SRV_UUID=$SRV_UUID"   >> "$GITHUB_ENV"
         echo "SRV_IDENT=$SRV_IDENT" >> "$GITHUB_ENV"
 
     - name: Install paper.jar into the server and start it
@@ -317,39 +434,45 @@ jobs:
           [ -d "$DIR" ] && break
           sleep 2
         done
-        [ -d "$DIR" ] || { echo "ERROR: server directory not created"; tail -n 40 /tmp/wings.log; exit 1; }
+        [ -d "$DIR" ] || { echo "ERROR: server directory not created"; tail -n 60 /tmp/wings.log; exit 1; }
+
         sudo cp paper.jar "$DIR/server.jar"
         echo "eula=true" | sudo tee "$DIR/eula.txt" > /dev/null
-        sudo chown --reference="$DIR" "$DIR/server.jar" "$DIR/eula.txt"
+        sudo chown --reference="$DIR" "$DIR/server.jar" "$DIR/eula.txt" 2>/dev/null || true
+
+        CODE=""
         for i in $(seq 1 20); do
           CODE=$(curl -s -o /tmp/power.json -w "%{http_code}" -X POST \
             "http://127.0.0.1/api/client/servers/$SRV_IDENT/power" \
             -H "Authorization: Bearer $CLIENT_KEY" -H "Accept: application/json" \
-            -H "Content-Type: application/json" -d '{"signal":"start"}')
+            -H "Content-Type: application/json" -d '{"signal":"start"}' || true)
           [ "$CODE" = "204" ] && break
           sleep 5
         done
-        [ "$CODE" = "204" ] || { echo "ERROR: could not start server"; tail -n 40 /tmp/wings.log; exit 1; }
+        [ "$CODE" = "204" ] || { echo "ERROR: could not start server (HTTP $CODE)"; cat /tmp/power.json; tail -n 60 /tmp/wings.log; exit 1; }
+        echo "Pterodactyl server started."
 
     # ============================================================
     #  CUSTOM DASHBOARD
     # ============================================================
     - name: Create Custom Dashboard (PHP pages)
       run: |
-        # Save runtime info for the daemon + dashboard
-        echo "$PORT1"        | sudo tee /tmp/dashboard_port1      > /dev/null
-        echo "$PORT2"        | sudo tee /tmp/dashboard_port2      > /dev/null
-        echo "$SRV_UUID"     | sudo tee /tmp/dashboard_srv_uuid   > /dev/null
-        echo "$SRV_IDENT"    | sudo tee /tmp/dashboard_srv_ident  > /dev/null
-        echo "$CLIENT_KEY"   | sudo tee /tmp/dashboard_client_key > /dev/null
-        echo "$PANEL_URL"    | sudo tee /tmp/dashboard_panel_url  > /dev/null
-        echo "$WINGS_URL"    | sudo tee /tmp/dashboard_wings_url  > /dev/null
-        echo "$STANDALONE_WORKDIR" | sudo tee /tmp/dashboard_workdir > /dev/null
-        echo "$JAVA_BIN"     | sudo tee /tmp/dashboard_java_bin   > /dev/null
+        set -e
+        echo "$PORT1"              | sudo tee /tmp/dashboard_port1      > /dev/null
+        echo "$PORT2"              | sudo tee /tmp/dashboard_port2      > /dev/null
+        echo "$SRV_UUID"           | sudo tee /tmp/dashboard_srv_uuid   > /dev/null
+        echo "$SRV_IDENT"          | sudo tee /tmp/dashboard_srv_ident  > /dev/null
+        echo "$CLIENT_KEY"         | sudo tee /tmp/dashboard_client_key > /dev/null
+        echo "$PANEL_URL"          | sudo tee /tmp/dashboard_panel_url  > /dev/null
+        echo "$WINGS_URL"          | sudo tee /tmp/dashboard_wings_url  > /dev/null
+        echo "$STANDALONE_WORKDIR" | sudo tee /tmp/dashboard_workdir    > /dev/null
+        echo "$JAVA_BIN"           | sudo tee /tmp/dashboard_java_bin   > /dev/null
+
         sudo chmod 600 /tmp/dashboard_client_key
         sudo chmod 644 /tmp/dashboard_port1 /tmp/dashboard_port2 /tmp/dashboard_srv_uuid \
                       /tmp/dashboard_srv_ident /tmp/dashboard_panel_url /tmp/dashboard_wings_url \
                       /tmp/dashboard_workdir /tmp/dashboard_java_bin
+
         # -------- dashboard.php --------
         sudo tee /var/www/pterodactyl/public/dashboard.php > /dev/null << 'PHP'
         <?php
@@ -431,6 +554,7 @@ jobs:
         </body>
         </html>
         PHP
+
         # -------- dashboard_action.php --------
         sudo tee /var/www/pterodactyl/public/dashboard_action.php > /dev/null << 'PHP'
         <?php
@@ -447,7 +571,10 @@ jobs:
         file_put_contents($f, json_encode(['target'=>$target,'action'=>$action,'ts'=>time()]));
         header('Location: /dashboard.php');
         PHP
-        sudo chown www-data:www-data /var/www/pterodactyl/public/dashboard.php /var/www/pterodactyl/public/dashboard_action.php
+
+        sudo chown www-data:www-data \
+          /var/www/pterodactyl/public/dashboard.php \
+          /var/www/pterodactyl/public/dashboard_action.php
 
     - name: Start Dashboard Daemon (background)
       run: |
@@ -456,32 +583,37 @@ jobs:
         set -u
         mkdir -p /tmp/dashboard_requests
         chmod 777 /tmp/dashboard_requests
-        WORKDIR=$(cat /tmp/dashboard_workdir 2>/dev/null || echo "/tmp")
+
+        WORKDIR=$(cat /tmp/dashboard_workdir  2>/dev/null || echo "/tmp")
         JAVA_BIN=$(cat /tmp/dashboard_java_bin 2>/dev/null || echo "java")
         SRV_UUID=$(cat /tmp/dashboard_srv_uuid 2>/dev/null || echo "")
         SRV_IDENT=$(cat /tmp/dashboard_srv_ident 2>/dev/null || echo "")
         CLIENT_KEY=$(cat /tmp/dashboard_client_key 2>/dev/null || echo "")
+
         while true; do
             PORT1=$(cat /tmp/dashboard_port1 2>/dev/null || echo "")
             PORT2=$(cat /tmp/dashboard_port2 2>/dev/null || echo "")
             PANEL_URL=$(cat /tmp/dashboard_panel_url 2>/dev/null || echo "")
             WINGS_URL=$(cat /tmp/dashboard_wings_url 2>/dev/null || echo "")
-            # ---- status checks ----
-            if pgrep -f "Xms512M.*paper.jar" > /dev/null 2>&1; then
+
+            # ---- status ----
+            if pgrep -f "\-Xms512M.*paper\.jar" > /dev/null 2>&1; then
                 ST_ST="running"
             else
                 ST_ST="stopped"
             fi
+
             PT_ST="stopped"
             if [ -n "$SRV_UUID" ]; then
                 if docker ps --format '{{.Names}}' 2>/dev/null | grep -qE "^${SRV_UUID:0:8}"; then
                     PT_ST="running"
                 fi
             fi
-            # ---- write status json ----
+
+            # ---- info json ----
             cat > /tmp/dashboard_info.json << JSON
         {
-          "standalone": {"address": "bore.pub:${PORT1:-N/A}", "status": "$ST_ST"},
+          "standalone":  {"address": "bore.pub:${PORT1:-N/A}", "status": "$ST_ST"},
           "pterodactyl": {"address": "bore.pub:${PORT2:-N/A}", "status": "$PT_ST"},
           "panel_url": "https://${PANEL_URL}",
           "wings_url": "https://${WINGS_URL}",
@@ -489,7 +621,8 @@ jobs:
         }
         JSON
             chmod 644 /tmp/dashboard_info.json
-            # ---- process requests ----
+
+            # ---- requests ----
             shopt -s nullglob
             for f in /tmp/dashboard_requests/*.json; do
                 ACTION=$(jq -r '.action // empty' "$f" 2>/dev/null)
@@ -497,10 +630,12 @@ jobs:
                 rm -f "$f"
                 case "${TARGET}:${ACTION}" in
                     standalone:start)
-                        ( cd "$WORKDIR" && nohup "$JAVA_BIN" -Xms512M -Xmx1G -jar paper.jar nogui > server.log 2>&1 & )
+                        if ! pgrep -f "\-Xms512M.*paper\.jar" > /dev/null 2>&1; then
+                            ( cd "$WORKDIR" && nohup "$JAVA_BIN" -Xms512M -Xmx1G -jar paper.jar nogui >> server.log 2>&1 & )
+                        fi
                         ;;
                     standalone:stop)
-                        pkill -f "Xms512M.*paper.jar" 2>/dev/null || true
+                        pkill -f "\-Xms512M.*paper\.jar" 2>/dev/null || true
                         ;;
                     pterodactyl:start)
                         if [ -n "$SRV_IDENT" ] && [ -n "$CLIENT_KEY" ]; then
@@ -523,9 +658,11 @@ jobs:
                 esac
             done
             shopt -u nullglob
+
             sleep 3
         done
         SH
+
         sudo chmod +x /usr/local/bin/dashboard_daemon.sh
         sudo nohup /usr/local/bin/dashboard_daemon.sh > /tmp/dashboard_daemon.log 2>&1 &
         disown || true
@@ -550,5 +687,11 @@ jobs:
         echo "Wings URL:           https://$WINGS_URL"
         echo "========================================================="
 
-    - name: Keep job alive (tail Wings log)
-      run: tail -f /tmp/wings.log
+    - name: Keep job alive
+      run: |
+        set +e
+        while true; do
+          echo "----- $(date -u) -----"
+          tail -n 20 /tmp/wings.log 2>/dev/null
+          sleep 300
+        done
