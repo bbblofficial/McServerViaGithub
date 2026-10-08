@@ -166,7 +166,10 @@ jobs:
               $make = function (int $type, string $prefix, array $extra) use ($cls, $encrypted) {
                   $plain = bin2hex(random_bytes(16));
                   $identifier = $prefix . substr(bin2hex(random_bytes(8)), 0, 11); // 16 chars
-                  $key = $cls::create(array_merge([
+                  
+                  // FIX: Use forceFill instead of create() to bypass mass assignment constraints
+                  $key = new $cls;
+                  $key->forceFill(array_merge([
                       'user_id'     => 1,
                       'key_type'    => $type,
                       'identifier'  => $identifier,
@@ -174,6 +177,8 @@ jobs:
                       'memo'        => 'automation',
                       'allowed_ips' => [],
                   ], $extra));
+                  $key->save();
+
                   return $identifier . $plain; // bearer token: identifier + token, no separator
               };
 
