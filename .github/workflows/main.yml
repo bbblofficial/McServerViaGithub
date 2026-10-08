@@ -16,12 +16,12 @@ on:
         type: string
         default: "2048"
       tunnel:
-        description: "bore (public, no setup) | sish (any sish host, e.g. tuns.sh) | frp / rathole (your own relay)"
+        description: "bore = public bore.pub (tested). openport = public openport.io (experimental, Minecraft only). No secrets needed."
         type: choice
-        options: [bore, sish, frp, rathole]
+        options: [bore, openport]
         default: bore
       server_host:
-        description: "Tunnel host for bore/sish (empty = bore.pub / tuns.sh). Any public bore or sish server works"
+        description: "Optional: use another public bore server instead of bore.pub"
         type: string
         default: ""
       mc_port:
@@ -42,14 +42,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  FRP_VERSION: "0.61.1"
-  FRP_PORT: ${{ secrets.FRP_PORT || '7000' }}
-  FRP_TOKEN: ${{ secrets.FRP_TOKEN }}
-  RATHOLE_PORT: ${{ secrets.RATHOLE_PORT || '2333' }}
-  RATHOLE_TOKEN: ${{ secrets.RATHOLE_TOKEN }}
   BORE_SECRET: ${{ secrets.BORE_SECRET }}
-  SISH_KEY: ${{ secrets.SISH_KEY }}
-  TUNNEL_HOST: ${{ inputs.tunnel == 'frp' && secrets.FRP_SERVER || inputs.tunnel == 'rathole' && secrets.RATHOLE_HOST || inputs.server_host || (inputs.tunnel == 'sish' && 'tuns.sh' || 'bore.pub') }}
+  TUNNEL_HOST: ${{ inputs.server_host || 'bore.pub' }}
   REQ_MC_PORT: ${{ inputs.mc_port }}
   REQ_PANEL_PORT: ${{ inputs.panel_port }}
   REQ_WINGS_PORT: ${{ inputs.wings_port }}
@@ -63,7 +57,7 @@ jobs:
 
     steps:
     # ------------------------------------------------------------
-    # 1. public TCP tunnel (open source): bore (public server) or frp (own relay)
+    # 1. public TCP tunnel (open source): bore (public bore.pub) or openport (public openport.io)
     # ------------------------------------------------------------
     - name: Start bore tunnel
       if: ${{ inputs.tunnel == 'bore' }}
@@ -118,121 +112,26 @@ jobs:
         fi
         echo "Tunnel OK -> ${TUNNEL_HOST}:${MC}"
 
-    - name: Start frp tunnel
-      if: ${{ inputs.tunnel == 'frp' }}
+    - name: Start openport tunnel
+      if: ${{ inputs.tunnel == 'openport' }}
       run: |
         set -e
-        { echo "MC_PORT=$REQ_MC_PORT"; echo "PANEL_PORT=$REQ_PANEL_PORT"; echo "WINGS_PORT=$REQ_WINGS_PORT"; } >> "$GITHUB_ENV"
-        [ -n "${{ secrets.FRP_SERVER }}" ] && [ -n "$FRP_TOKEN" ] || { echo "::error::tunnel=frp needs your own frp server. Add secrets FRP_SERVER and FRP_TOKEN, or pick tunnel=bore (no setup)."; exit 1; }
-        curl -fsSL "https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_linux_amd64.tar.gz" | tar xz
-        sudo install -m 755 "frp_${FRP_VERSION}_linux_amd64/frpc" /usr/local/bin/frpc
-
-        cat > frpc.toml << EOF
-        serverAddr = "${TUNNEL_HOST}"
-        serverPort = ${FRP_PORT}
-        auth.method = "token"
-        auth.token = "${FRP_TOKEN}"
-        log.to = "/tmp/frpc.log"
-
-        [[proxies]]
-        name = "minecraft"
-        type = "tcp"
-        localIP = "127.0.0.1"
-        localPort = 25565
-        remotePort = ${REQ_MC_PORT}
-        EOF
-        if [ "${{ inputs.with_panel }}" = "true" ]; then
-          cat >> frpc.toml << EOF
-
-        [[proxies]]
-        name = "panel"
-        type = "tcp"
-        localIP = "127.0.0.1"
-        localPort = 80
-        remotePort = ${REQ_PANEL_PORT}
-
-        [[proxies]]
-        name = "wings"
-        type = "tcp"
-        localIP = "127.0.0.1"
-        localPort = ${REQ_WINGS_PORT}
-        remotePort = ${REQ_WINGS_PORT}
-        EOF
-        fi
-        nohup frpc -c frpc.toml > /tmp/frpc.out 2>&1 &
-        for i in $(seq 1 20); do grep -q "start proxy success" /tmp/frpc.log 2>/dev/null && break; sleep 1; done
-        grep -q "start proxy success" /tmp/frpc.log || { echo "::error::frpc failed"; cat /tmp/frpc.log /tmp/frpc.out || true; exit 1; }
-        echo "Tunnel OK -> ${TUNNEL_HOST}:${REQ_MC_PORT}"
-
-    - name: Start rathole tunnel
-      if: ${{ inputs.tunnel == 'rathole' }}
-      run: |
-        set -e
-        [ -n "${{ secrets.RATHOLE_HOST }}" ] && [ -n "$RATHOLE_TOKEN" ] || { echo "::error::tunnel=rathole needs your own rathole server. Add secrets RATHOLE_HOST and RATHOLE_TOKEN, or pick tunnel=bore (no setup)."; exit 1; }
-        { echo "MC_PORT=$REQ_MC_PORT"; echo "PANEL_PORT=$REQ_PANEL_PORT"; echo "WINGS_PORT=$REQ_WINGS_PORT"; } >> "$GITHUB_ENV"
-        curl -fsSL -o rathole.zip "https://github.com/rapiz1/rathole/releases/download/v0.5.0/rathole-x86_64-unknown-linux-gnu.zip"
-        unzip -o rathole.zip rathole && chmod +x rathole
-
-        cat > client.toml << EOF
-        [client]
-        remote_addr = "${TUNNEL_HOST}:${RATHOLE_PORT}"
-        default_token = "${RATHOLE_TOKEN}"
-
-        [client.services.mc]
-        local_addr = "127.0.0.1:25565"
-        EOF
-        if [ "${{ inputs.with_panel }}" = "true" ]; then
-          cat >> client.toml << EOF
-
-        [client.services.panel]
-        local_addr = "127.0.0.1:80"
-
-        [client.services.wings]
-        local_addr = "127.0.0.1:${REQ_WINGS_PORT}"
-        EOF
-        fi
-        nohup ./rathole client.toml > /tmp/rathole.log 2>&1 &
-        for i in $(seq 1 20); do grep -q "Control channel established" /tmp/rathole.log && break; sleep 1; done
-        grep -q "Control channel established" /tmp/rathole.log || { echo "::error::rathole could not connect"; cat /tmp/rathole.log; exit 1; }
-        echo "Tunnel OK -> ${TUNNEL_HOST}:${REQ_MC_PORT}  (the server-side rathole must bind these ports)"
-
-    - name: Start sish tunnel
-      if: ${{ inputs.tunnel == 'sish' }}
-      run: |
-        set -e
-        { echo "MC_PORT=$REQ_MC_PORT"; echo "PANEL_PORT=$REQ_PANEL_PORT"; echo "WINGS_PORT=$REQ_WINGS_PORT"; } >> "$GITHUB_ENV"
-        mkdir -p "$HOME/.ssh"
-        KEY="$HOME/.ssh/tunnel_key"
-        if [ -n "$SISH_KEY" ]; then printf '%s\n' "$SISH_KEY" > "$KEY"; else ssh-keygen -q -t ed25519 -N "" -f "$KEY"; fi
-        chmod 600 "$KEY"
-        FWD="-R ${REQ_MC_PORT}:localhost:25565"
-        if [ "${{ inputs.with_panel }}" = "true" ]; then
-          FWD="$FWD -R ${REQ_PANEL_PORT}:localhost:80 -R ${REQ_WINGS_PORT}:localhost:${REQ_WINGS_PORT}"
-        fi
-
-        cat > tunnel.sh << EOF
-        #!/bin/bash
-        while true; do
-          echo "\$(date -u) connecting" >> /tmp/tunnel.log
-          sleep infinity | ssh -T -i $KEY \\
-            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\
-            -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \\
-            -o ExitOnForwardFailure=yes -o ConnectTimeout=15 \\
-            $FWD ${TUNNEL_HOST} >> /tmp/tunnel.log 2>&1
-          echo "\$(date -u) tunnel dropped, reconnecting" >> /tmp/tunnel.log
-          sleep 5
+        [ "${{ inputs.with_panel }}" != "true" ] || { echo "::error::openport gives one random port, so it cannot be used with with_panel. Use tunnel=bore."; exit 1; }
+        pip install --user openport
+        nohup "$HOME/.local/bin/openport" 25565 > /tmp/openport.log 2>&1 &
+        ADDR=""
+        for i in $(seq 1 45); do
+          ADDR=$(grep -oE '[A-Za-z0-9.-]*openport[A-Za-z0-9.-]*:[0-9]{3,5}' /tmp/openport.log | head -1 || true)
+          [ -n "$ADDR" ] && break
+          sleep 1
         done
-        EOF
-        chmod +x tunnel.sh
-        : > /tmp/tunnel.log
-        nohup ./tunnel.sh > /dev/null 2>&1 &
-        sleep 20
-        cat /tmp/tunnel.log
-        if ! pgrep -f "ssh -T -i" > /dev/null || grep -qiE "denied|refused|already|in use|failed|not allowed" /tmp/tunnel.log; then
-          echo "::error::sish tunnel failed. Most sish hosts (tuns.sh, ssi.sh) require your SSH public key to be registered; put the private key in secret SISH_KEY."
+        if [ -z "$ADDR" ]; then
+          echo "::error::openport did not return an address. Use tunnel=bore."
+          cat /tmp/openport.log || true
           exit 1
         fi
-        echo "Tunnel OK -> ${TUNNEL_HOST}:${REQ_MC_PORT}"
+        echo "PUBLIC_ADDR=$ADDR" >> "$GITHUB_ENV"
+        echo "Tunnel OK -> $ADDR"
 
     # ------------------------------------------------------------
     # 2. Paper jar
@@ -497,7 +396,7 @@ jobs:
     - name: Show connection info
       run: |
         echo "========================================================="
-        echo " MINECRAFT (1.8.8):  ${TUNNEL_HOST}:${MC_PORT}"
+        echo " MINECRAFT (1.8.8):  ${PUBLIC_ADDR:-${TUNNEL_HOST}:${MC_PORT}}"
         if [ "${{ inputs.with_panel }}" = "true" ]; then
           echo " PANEL:              http://${TUNNEL_HOST}:${PANEL_PORT}"
           echo " LOGIN:              admin@example.com / (PANEL_PASSWORD secret)"
@@ -507,11 +406,6 @@ jobs:
     - name: Keep alive (watchdog)
       run: |
         while true; do
-          case "${{ inputs.tunnel }}" in
-            frp) pgrep -x frpc > /dev/null || nohup frpc -c frpc.toml >> /tmp/frpc.out 2>&1 & ;;
-            rathole) pgrep -x rathole > /dev/null || nohup ./rathole client.toml >> /tmp/rathole.log 2>&1 & ;;
-            sish) pgrep -f tunnel.sh > /dev/null || nohup ./tunnel.sh > /dev/null 2>&1 & ;;
-          esac
           if [ "${{ inputs.with_panel }}" != "true" ] && ! kill -0 "$(cat paper.pid)" 2>/dev/null; then
             echo "$(date -u) Paper stopped. Last log:"; tail -n 30 server.log
             exit 1
