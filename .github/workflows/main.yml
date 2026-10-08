@@ -534,6 +534,22 @@ jobs:
         [ "$CODE" = "200" ] || [ "$CODE" = "401" ] || { echo "::error::Wings did not start"; tail -n 60 /tmp/wings.log; exit 1; }
         echo "Wings up."
 
+        # The node address is the public tunnel host (browsers need it). The panel runs on this
+        # same machine, so send its own requests to that address straight back to localhost
+        # instead of looping through the tunnel (that loop gave DaemonConnectionException 504).
+        BIP=$(getent ahostsv4 "$TUNNEL_HOST" | awk '{print $1; exit}')
+        if [ -n "$BIP" ]; then
+          sudo iptables -t nat -A OUTPUT -d "$BIP" -p tcp --dport "$WINGS_PORT" -j REDIRECT
+          sudo iptables -t nat -A OUTPUT -d "$BIP" -p tcp --dport "$PANEL_PORT" -j REDIRECT --to-ports 80
+          echo "Local redirect for $TUNNEL_HOST ($BIP) ports $WINGS_PORT/$PANEL_PORT enabled."
+        fi
+        CODE=$(curl -s -o /dev/null -m 10 -w "%{http_code}" "http://${TUNNEL_HOST}:${WINGS_PORT}/api/system" || true)
+        if [ "$CODE" != "200" ] && [ "$CODE" != "401" ]; then
+          echo "::error::panel cannot reach Wings at ${TUNNEL_HOST}:${WINGS_PORT} (HTTP $CODE)"
+          tail -n 60 /tmp/wings.log; exit 1
+        fi
+        echo "Panel -> Wings connection OK."
+
     - name: Create and start Minecraft server in Pterodactyl
       if: ${{ inputs.with_panel }}
       run: |
@@ -550,15 +566,22 @@ jobs:
           | jq -r '.data[] | select(.attributes.name=="Paper") | .attributes.id' | head -1)
         [ -n "$EGG_ID" ] && [ "$EGG_ID" != "null" ] || { echo "::error::Paper egg not found"; exit 1; }
 
-        SRV=$(curl -s -X POST http://127.0.0.1/api/application/servers "${H[@]}" -d "{
+        PAYLOAD="{
           \"name\":\"Paper 1.8.8\",\"user\":1,\"node\":$NODE_ID,\"nest\":1,\"egg\":$EGG_ID,
           \"docker_image\":\"ghcr.io/parkervcp/yolks:java_8\",
           \"startup\":\"java -Xms1G -XX:+UseG1GC -jar {{SERVER_JARFILE}}\",
           \"environment\":{\"SERVER_JARFILE\":\"server.jar\",\"MINECRAFT_VERSION\":\"1.8.8\",\"MC_VERSION\":\"1.8.8\",\"BUILD_NUMBER\":\"445\",\"DL_PATH\":\"\"},
           \"limits\":{\"memory\":0,\"swap\":0,\"disk\":10240,\"io\":500,\"cpu\":200},
           \"feature_limits\":{\"databases\":0,\"backups\":0,\"allocations\":1},
-          \"allocation\":{\"default\":$ALLOC_ID},\"skip_scripts\":true,\"start_on_completion\":false}")
-        SRV_UUID=$(echo "$SRV" | jq -r '.attributes.uuid')
+          \"allocation\":{\"default\":$ALLOC_ID},\"skip_scripts\":true,\"start_on_completion\":false}"
+        SRV=""; SRV_UUID=""
+        for try in 1 2 3 4 5; do
+          SRV=$(curl -s -m 120 -X POST http://127.0.0.1/api/application/servers "${H[@]}" -d "$PAYLOAD")
+          SRV_UUID=$(echo "$SRV" | jq -r '.attributes.uuid' 2>/dev/null || true)
+          [ -n "$SRV_UUID" ] && [ "$SRV_UUID" != "null" ] && break
+          echo "server creation attempt $try failed, retrying in 10s:"; echo "$SRV" | jq -c . 2>/dev/null || echo "$SRV"
+          sleep 10
+        done
         SRV_IDENT=$(echo "$SRV" | jq -r '.attributes.identifier')
         [ "$SRV_UUID" != "null" ] && [ -n "$SRV_UUID" ] || { echo "::error::server creation failed"; echo "$SRV" | jq .; exit 1; }
         echo "SRV_IDENT=$SRV_IDENT" >> "$GITHUB_ENV"
