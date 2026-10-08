@@ -1,4 +1,4 @@
-name: Paper 1.8.8 + optional Pterodactyl (selectable open-source tunnel)
+name: Paper 1.8.8 + optional Pterodactyl (selectable tunnel)
 
 on:
   workflow_dispatch:
@@ -16,20 +16,12 @@ on:
         type: string
         default: "2048"
       tunnel:
-        description: "bore = bore.pub | bore-fallback = bore.pub then server_host | serveo = OpenSSH to serveo.net (MC only) | frp = your own frps at server_host (MC only)"
+        description: "auto = bore, then serveo, then pinggy | bore = bore.pub | serveo = serveo.net (ssh) | pinggy = pinggy.io (ssh). Panel needs bore or auto."
         type: choice
-        options: [bore, bore-fallback, serveo, frp]
-        default: bore
-      server_host:
-        description: "bore: another bore server | frp: address of YOUR frps server (required for frp)"
-        type: string
-        default: ""
-      frp_port:
-        description: "frp only: bindPort of your frps server"
-        type: string
-        default: "7000"
+        options: [auto, bore, serveo, pinggy]
+        default: auto
       mc_port:
-        description: "Preferred public port (if taken, a free one is picked and printed in the log)"
+        description: "Preferred public port (bore/serveo; if taken, a free one is picked and printed in the log)"
         type: string
         default: "47310"
       panel_port:
@@ -65,13 +57,9 @@ jobs:
         set -e
         PW="$(openssl rand -hex 8)Aa1"
         echo "PANEL_PASS=$PW" >> "$GITHUB_ENV"
-        if [ "${{ inputs.with_panel }}" = "true" ] && [ "${{ inputs.tunnel }}" != "bore" ] && [ "${{ inputs.tunnel }}" != "bore-fallback" ]; then
-          echo "::error::with_panel only works with bore or bore-fallback."; exit 1
+        if [ "${{ inputs.with_panel }}" = "true" ] && [ "${{ inputs.tunnel }}" != "bore" ] && [ "${{ inputs.tunnel }}" != "auto" ]; then
+          echo "::error::with_panel only works with tunnel=bore or tunnel=auto."; exit 1
         fi
-        if [ "${{ inputs.tunnel }}" = "frp" ] && [ -z "${{ inputs.server_host }}" ]; then
-          echo "::error::tunnel=frp needs server_host (your own frps server)."; exit 1
-        fi
-        # open the local firewall (runners normally have none, this is just to be sure)
         sudo ufw disable 2>/dev/null || true
         sudo iptables -P INPUT ACCEPT 2>/dev/null || true
         sudo iptables -P FORWARD ACCEPT 2>/dev/null || true
@@ -80,17 +68,20 @@ jobs:
         echo "Firewall opened."
 
     # ------------------------------------------------------------
-    # 1a. bore (public bore.pub, optional custom/fallback server)
+    # 1. public TCP tunnel (bore / serveo / pinggy / auto)
     # ------------------------------------------------------------
-    - name: Start bore tunnel
-      if: ${{ inputs.tunnel == 'bore' || inputs.tunnel == 'bore-fallback' }}
+    - name: Start tunnel
       run: |
         set -e
-        VER=$(curl -fsSL https://api.github.com/repos/ekzhang/bore/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+' || true)
-        [ -n "$VER" ] || VER="v0.6.0"
-        curl -fsSL "https://github.com/ekzhang/bore/releases/download/${VER}/bore-${VER}-x86_64-unknown-linux-musl.tar.gz" | tar xz
-        chmod +x bore
+        MODE="${{ inputs.tunnel }}"
+        PANEL="${{ inputs.with_panel }}"
+        BORE_HOST="bore.pub"
+        ADDR=""
 
+        mkdir -p ~/.ssh
+        [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519 -q
+
+        # ---------- helper scripts ----------
         cat > bore_sup.sh << 'EOF'
         #!/bin/bash
         # usage: bore_sup.sh LOCAL_PORT REMOTE_PORT BORE_BIN HOST
@@ -100,71 +91,6 @@ jobs:
           sleep 3
         done
         EOF
-        chmod +x bore_sup.sh
-
-        # open_port HOST NAME LOCAL|same PREFERRED_PORT -> prints the port actually obtained
-        open_port() {
-          local host=$1 name=$2 loc=$3 port=$4 L i t
-          for t in 1 2 3 4 5 6 7 8; do
-            L=$loc; [ "$loc" = "same" ] && L=$port
-            : > "/tmp/bore_$port.log"
-            nohup ./bore_sup.sh "$L" "$port" "$PWD/bore" "$host" > /dev/null 2>&1 &
-            for i in $(seq 1 10); do
-              if sed 's/\x1b\[[0-9;]*m//g' "/tmp/bore_$port.log" | grep -q "$host:$port"; then
-                echo "$name -> $host:$port" >&2
-                echo "$port"; return 0
-              fi
-              grep -q "port already in use" "/tmp/bore_$port.log" && break
-              sleep 1
-            done
-            echo "$name: port $port not available on $host, trying another" >&2
-            pkill -f "bore_sup.sh $L $port " 2>/dev/null || true
-            pkill -f "local $L --to $host --port $port" 2>/dev/null || true
-            port=$((RANDOM % 40000 + 20000))
-          done
-          return 1
-        }
-
-        CUSTOM="${{ inputs.server_host }}"
-        if [ "${{ inputs.tunnel }}" = "bore-fallback" ]; then
-          HOSTS="bore.pub ${CUSTOM}"
-        else
-          HOSTS="${CUSTOM:-bore.pub}"
-        fi
-
-        MC=""; USED=""
-        for H in $HOSTS; do
-          if MC=$(open_port "$H" minecraft 25565 "$REQ_MC_PORT"); then USED="$H"; break; fi
-          echo "bore host $H failed"; MC=""
-        done
-        [ -n "$MC" ] || { echo "::error::no bore server gave a free port"; tail -n 20 /tmp/bore_*.log || true; exit 1; }
-        echo "TUNNEL_HOST=$USED" >> "$GITHUB_ENV"
-        echo "MC_PORT=$MC" >> "$GITHUB_ENV"
-        echo "PUBLIC_ADDR=$USED:$MC" >> "$GITHUB_ENV"
-
-        if [ "${{ inputs.with_panel }}" = "true" ]; then
-          PP=$(open_port "$USED" panel 80 "$REQ_PANEL_PORT") || { echo "::error::no panel port"; exit 1; }
-          WP=$(open_port "$USED" wings same "$REQ_WINGS_PORT") || { echo "::error::no wings port"; exit 1; }
-          echo "PANEL_PORT=$PP" >> "$GITHUB_ENV"
-          echo "WINGS_PORT=$WP" >> "$GITHUB_ENV"
-        fi
-        echo "Tunnel OK -> ${USED}:${MC}"
-
-    # ------------------------------------------------------------
-    # 1b. serveo (plain OpenSSH client, Minecraft only)
-    # ------------------------------------------------------------
-    - name: Start serveo tunnel
-      if: ${{ inputs.tunnel == 'serveo' }}
-      run: |
-        set -e
-        echo "--- reachability check for serveo.net:22 ---"
-        if timeout 10 bash -c 'cat < /dev/null > /dev/tcp/serveo.net/22' 2>/dev/null; then
-          echo "serveo.net:22 is reachable"
-        else
-          echo "serveo.net:22 is NOT reachable from this runner (service down or blocked)"
-        fi
-        mkdir -p ~/.ssh
-        [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519 -q
 
         cat > serveo_sup.sh << 'EOF'
         #!/bin/bash
@@ -179,84 +105,124 @@ jobs:
           sleep 3
         done
         EOF
-        chmod +x serveo_sup.sh
 
-        ADDR=""
-        PORT="$REQ_MC_PORT"
-        for t in 1 2 3 4; do
-          : > /tmp/serveo.log
-          nohup ./serveo_sup.sh "$PORT" > /dev/null 2>&1 &
-          for i in $(seq 1 20); do
-            ADDR=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/serveo.log | grep -oE 'serveo\.net:[0-9]{2,5}' | head -1 || true)
-            [ -n "$ADDR" ] && break
-            sleep 1
-          done
-          [ -n "$ADDR" ] && break
-          echo "serveo: port $PORT failed. Log of this attempt:"
-          cat /tmp/serveo.log || true
-          pkill -f serveo_sup.sh 2>/dev/null || true
-          pkill -f "ssh -T" 2>/dev/null || true
-          PORT=$((RANDOM % 40000 + 20000))
-        done
-        if [ -z "$ADDR" ]; then
-          echo "::error::serveo did not return an address (service down?). Use tunnel=bore or tunnel=frp."
-          exit 1
-        fi
-        echo "PUBLIC_ADDR=$ADDR" >> "$GITHUB_ENV"
-        echo "Tunnel OK -> $ADDR"
-
-    # ------------------------------------------------------------
-    # 1c. frp (open source, needs YOUR frps server, no token)
-    # ------------------------------------------------------------
-    - name: Start frp tunnel
-      if: ${{ inputs.tunnel == 'frp' }}
-      run: |
-        set -e
-        VER=$(curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+' || true)
-        [ -n "$VER" ] || VER="v0.61.1"
-        V="${VER#v}"
-        curl -fsSL "https://github.com/fatedier/frp/releases/download/${VER}/frp_${V}_linux_amd64.tar.gz" | tar xz
-        cp "frp_${V}_linux_amd64/frpc" ./frpc
-        chmod +x frpc
-
-        cat > frpc.toml << EOF
-        serverAddr = "${{ inputs.server_host }}"
-        serverPort = ${{ inputs.frp_port }}
-        loginFailExit = true
-
-        [[proxies]]
-        name = "minecraft-$RANDOM"
-        type = "tcp"
-        localIP = "127.0.0.1"
-        localPort = 25565
-        remotePort = ${REQ_MC_PORT}
-        EOF
-
-        cat > frp_sup.sh << 'EOF'
+        cat > pinggy_sup.sh << 'EOF'
         #!/bin/bash
         while true; do
-          ./frpc -c frpc.toml >> /tmp/frpc.log 2>&1
-          echo "$(date -u) frpc exited, restarting" >> /tmp/frpc.log
+          tail -f /dev/null | ssh -T -p 443 \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+            -o ExitOnForwardFailure=yes -o ConnectTimeout=15 \
+            -R0:localhost:25565 tcp@a.pinggy.io >> /tmp/pinggy.log 2>&1
+          echo "$(date -u) pinggy exited, restarting" >> /tmp/pinggy.log
           sleep 3
         done
         EOF
-        chmod +x frp_sup.sh
-        : > /tmp/frpc.log
-        nohup ./frp_sup.sh > /dev/null 2>&1 &
+        chmod +x bore_sup.sh serveo_sup.sh pinggy_sup.sh
 
+        # open_port NAME LOCAL|same PREFERRED_PORT -> prints the port actually obtained
+        open_port() {
+          local name=$1 loc=$2 port=$3 L i t
+          for t in 1 2 3 4 5 6 7 8; do
+            L=$loc; [ "$loc" = "same" ] && L=$port
+            : > "/tmp/bore_$port.log"
+            nohup ./bore_sup.sh "$L" "$port" "$PWD/bore" "$BORE_HOST" > /dev/null 2>&1 &
+            for i in $(seq 1 10); do
+              if sed 's/\x1b\[[0-9;]*m//g' "/tmp/bore_$port.log" | grep -q "$BORE_HOST:$port"; then
+                echo "$name -> $BORE_HOST:$port" >&2
+                echo "$port"; return 0
+              fi
+              grep -q "port already in use" "/tmp/bore_$port.log" && break
+              sleep 1
+            done
+            echo "$name: port $port not available, trying another" >&2
+            pkill -f "bore_sup.sh $L $port " 2>/dev/null || true
+            pkill -f "local $L --to $BORE_HOST --port $port" 2>/dev/null || true
+            port=$((RANDOM % 40000 + 20000))
+          done
+          return 1
+        }
+
+        # ---------- bore ----------
+        try_bore() {
+          local VER MC PP WP
+          if [ ! -x ./bore ]; then
+            VER=$(curl -fsSL https://api.github.com/repos/ekzhang/bore/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+' || true)
+            [ -n "$VER" ] || VER="v0.6.0"
+            curl -fsSL "https://github.com/ekzhang/bore/releases/download/${VER}/bore-${VER}-x86_64-unknown-linux-musl.tar.gz" | tar xz || return 1
+            chmod +x bore
+          fi
+          MC=$(open_port minecraft 25565 "$REQ_MC_PORT") || { echo "bore: no free port on $BORE_HOST (down?)"; tail -n 20 /tmp/bore_*.log 2>/dev/null || true; return 1; }
+          echo "TUNNEL_HOST=$BORE_HOST" >> "$GITHUB_ENV"
+          echo "MC_PORT=$MC" >> "$GITHUB_ENV"
+          ADDR="$BORE_HOST:$MC"
+          if [ "$PANEL" = "true" ]; then
+            PP=$(open_port panel 80 "$REQ_PANEL_PORT") || { echo "::error::no panel port"; exit 1; }
+            WP=$(open_port wings same "$REQ_WINGS_PORT") || { echo "::error::no wings port"; exit 1; }
+            echo "PANEL_PORT=$PP" >> "$GITHUB_ENV"
+            echo "WINGS_PORT=$WP" >> "$GITHUB_ENV"
+          fi
+          return 0
+        }
+
+        # ---------- serveo ----------
+        try_serveo() {
+          local PORT="$REQ_MC_PORT" t i
+          if ! timeout 10 bash -c 'cat < /dev/null > /dev/tcp/serveo.net/22' 2>/dev/null; then
+            echo "serveo.net:22 is not reachable (service down?)"; return 1
+          fi
+          for t in 1 2 3; do
+            : > /tmp/serveo.log
+            nohup ./serveo_sup.sh "$PORT" > /dev/null 2>&1 &
+            for i in $(seq 1 20); do
+              ADDR=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/serveo.log | grep -oE 'serveo\.net:[0-9]{2,5}' | head -1 || true)
+              [ -n "$ADDR" ] && return 0
+              sleep 1
+            done
+            echo "serveo: port $PORT failed. Log:"; cat /tmp/serveo.log || true
+            pkill -f serveo_sup.sh 2>/dev/null || true
+            pkill -f "serveo.net" 2>/dev/null || true
+            PORT=$((RANDOM % 40000 + 20000))
+          done
+          return 1
+        }
+
+        # ---------- pinggy ----------
+        try_pinggy() {
+          local i
+          : > /tmp/pinggy.log
+          nohup ./pinggy_sup.sh > /dev/null 2>&1 &
+          for i in $(seq 1 30); do
+            ADDR=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/pinggy.log | grep -oE 'tcp://[A-Za-z0-9.-]+:[0-9]{2,5}' | head -1 | sed 's#tcp://##' || true)
+            [ -n "$ADDR" ] && return 0
+            sleep 1
+          done
+          echo "pinggy: no address. Log:"; cat /tmp/pinggy.log || true
+          pkill -f pinggy_sup.sh 2>/dev/null || true
+          pkill -f "pinggy.io" 2>/dev/null || true
+          return 1
+        }
+
+        # ---------- run selected mode ----------
         OK=""
-        for i in $(seq 1 30); do
-          if grep -q "start proxy success" /tmp/frpc.log; then OK=1; break; fi
-          sleep 1
-        done
-        if [ -z "$OK" ]; then
-          echo "::error::frpc could not register the proxy (server unreachable, port not allowed, or auth token required)"
-          cat /tmp/frpc.log || true
-          exit 1
+        if [ "$PANEL" = "true" ]; then
+          try_bore && OK=1
+        else
+          case "$MODE" in
+            bore)   try_bore   && OK=1 ;;
+            serveo) try_serveo && OK=1 ;;
+            pinggy) try_pinggy && OK=1 ;;
+            auto)
+              try_bore   && OK=1 || true
+              [ -n "$OK" ] || { echo ">> bore failed, trying serveo";  try_serveo && OK=1 || true; }
+              [ -n "$OK" ] || { echo ">> serveo failed, trying pinggy"; try_pinggy && OK=1 || true; }
+              ;;
+          esac
         fi
-        echo "TUNNEL_HOST=${{ inputs.server_host }}" >> "$GITHUB_ENV"
-        echo "PUBLIC_ADDR=${{ inputs.server_host }}:${REQ_MC_PORT}" >> "$GITHUB_ENV"
-        echo "Tunnel OK -> ${{ inputs.server_host }}:${REQ_MC_PORT}"
+
+        [ -n "$OK" ] || { echo "::error::no tunnel could be opened (all selected services failed or are down)"; exit 1; }
+        echo "PUBLIC_ADDR=$ADDR" >> "$GITHUB_ENV"
+        echo "Tunnel OK -> $ADDR"
 
     # ------------------------------------------------------------
     # 2. Paper jar
@@ -530,10 +496,19 @@ jobs:
 
     - name: Keep alive (watchdog)
       run: |
+        LAST=""
         while true; do
           if [ "${{ inputs.with_panel }}" != "true" ] && ! kill -0 "$(cat paper.pid)" 2>/dev/null; then
             echo "$(date -u) Paper stopped. Last log:"; tail -n 30 server.log
             exit 1
+          fi
+          # pinggy free tunnels reconnect and can change address: print the current one
+          if [ -f /tmp/pinggy.log ]; then
+            CUR=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/pinggy.log | grep -oE 'tcp://[A-Za-z0-9.-]+:[0-9]{2,5}' | tail -1 | sed 's#tcp://##' || true)
+            if [ -n "$CUR" ] && [ "$CUR" != "$LAST" ]; then
+              echo "$(date -u) CURRENT MINECRAFT ADDRESS: $CUR"
+              LAST="$CUR"
+            fi
           fi
           sleep 30
         done
