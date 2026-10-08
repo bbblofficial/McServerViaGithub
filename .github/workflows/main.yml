@@ -11,7 +11,7 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '8' # Minecraft 1.8.8 requires Java 8
+          java-version: '8'
 
       - name: Download Paper 1.8.8 Build 445
         run: |
@@ -27,8 +27,8 @@ jobs:
 
       - name: Start Cloudflared Tunnel
         run: |
-          # Start Cloudflared pointing to the default Minecraft TCP port
-          cloudflared tunnel --url tcp://localhost:25565 --logfile tunnel.log &
+          # Start Cloudflared pointing to the IPv4 Minecraft TCP port
+          cloudflared tunnel --url tcp://127.0.0.1:25565 --logfile tunnel.log &
           
           # Wait for the tunnel to generate a URL
           sleep 10
