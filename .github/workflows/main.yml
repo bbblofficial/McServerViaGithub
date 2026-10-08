@@ -1,4 +1,4 @@
-name: Paper 1.8.8 + optional Pterodactyl (sish open-source TCP tunnel)
+name: Paper 1.8.8 + optional Pterodactyl (bore or frp tunnel)
 
 on:
   workflow_dispatch:
@@ -15,6 +15,11 @@ on:
         description: "RAM for Minecraft server in MB"
         type: string
         default: "2048"
+      tunnel:
+        description: "bore = no setup, public bore.pub (open source). frp = your own relay (needs FRP_* secrets)"
+        type: choice
+        options: [bore, frp]
+        default: bore
       mc_port:
         description: "Public TCP port on the tunnel host for Minecraft (change if taken)"
         type: string
@@ -33,9 +38,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # sish = open-source (MIT) SSH tunnel server; ssi.sh is its public demo instance.
-  # Change to your own sish host or tuns.sh if you prefer.
-  TUNNEL_HOST: ssi.sh
+  FRP_VERSION: "0.61.1"
+  FRP_PORT: ${{ secrets.FRP_PORT || '7000' }}
+  FRP_TOKEN: ${{ secrets.FRP_TOKEN }}
+  TUNNEL_HOST: ${{ inputs.tunnel == 'frp' && secrets.FRP_SERVER || 'bore.pub' }}
   MC_PORT: ${{ inputs.mc_port }}
   PANEL_PORT: ${{ inputs.panel_port }}
   WINGS_PORT: ${{ inputs.wings_port }}
@@ -49,43 +55,93 @@ jobs:
 
     steps:
     # ------------------------------------------------------------
-    # 1. public TCP tunnel: plain OpenSSH -> sish (open source)
+    # 1. public TCP tunnel (open source): bore (public server) or frp (own relay)
     # ------------------------------------------------------------
-    - name: Start sish TCP tunnel
+    - name: Start bore tunnel
+      if: ${{ inputs.tunnel == 'bore' }}
       run: |
         set -e
-        ssh-keygen -q -t ed25519 -N "" -f "$HOME/.ssh_tunnel_key"
-        FWD="-R ${MC_PORT}:localhost:25565"
-        if [ "${{ inputs.with_panel }}" = "true" ]; then
-          FWD="$FWD -R ${PANEL_PORT}:localhost:80 -R ${WINGS_PORT}:localhost:${WINGS_PORT}"
-        fi
+        VER=$(curl -fsSL https://api.github.com/repos/ekzhang/bore/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+' || true)
+        [ -n "$VER" ] || VER="v0.6.0"
+        curl -fsSL "https://github.com/ekzhang/bore/releases/download/${VER}/bore-${VER}-x86_64-unknown-linux-musl.tar.gz" | tar xz
+        chmod +x bore
 
-        cat > tunnel.sh << EOF
+        cat > bore_sup.sh << 'EOF'
         #!/bin/bash
-        n=0
+        # usage: bore_sup.sh LOCAL_PORT REMOTE_PORT BORE_BIN
         while true; do
-          n=\$((n+1))
-          echo "\$(date -u) connecting (attempt \$n)" >> /tmp/tunnel.log
-          sleep infinity | ssh -T -i $HOME/.ssh_tunnel_key \
-            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-            -o ExitOnForwardFailure=yes -o ConnectTimeout=15 \
-            $FWD ${TUNNEL_HOST} >> /tmp/tunnel.log 2>&1
-          echo "\$(date -u) tunnel dropped, reconnecting" >> /tmp/tunnel.log
-          sleep 5
+          "$3" local "$1" --to bore.pub --port "$2" >> "/tmp/bore_$2.log" 2>&1
+          echo "$(date -u) bore $2 exited, restarting" >> "/tmp/bore_$2.log"
+          sleep 3
         done
         EOF
-        chmod +x tunnel.sh
-        : > /tmp/tunnel.log
-        nohup ./tunnel.sh > /dev/null 2>&1 &
+        chmod +x bore_sup.sh
 
-        # ExitOnForwardFailure=yes: if ssh is still alive after 20 s, the ports were granted
-        sleep 20
-        echo "----- tunnel.log -----"; cat /tmp/tunnel.log
-        if ! pgrep -f "ssh -T -i" > /dev/null || grep -qiE "denied|refused|already|in use|failed|not allowed" /tmp/tunnel.log; then
-          echo "::error::tunnel failed (port ${MC_PORT} taken, or ${TUNNEL_HOST} is down/limited). Try another mc_port or your own sish host."
-          exit 1
+        PORTS="${MC_PORT}"
+        nohup ./bore_sup.sh 25565 "$MC_PORT" "$PWD/bore" > /dev/null 2>&1 &
+        if [ "${{ inputs.with_panel }}" = "true" ]; then
+          nohup ./bore_sup.sh 80 "$PANEL_PORT" "$PWD/bore" > /dev/null 2>&1 &
+          nohup ./bore_sup.sh "$WINGS_PORT" "$WINGS_PORT" "$PWD/bore" > /dev/null 2>&1 &
+          PORTS="$PORTS $PANEL_PORT $WINGS_PORT"
         fi
+
+        for p in $PORTS; do
+          OK=0
+          for i in $(seq 1 30); do
+            if sed 's/\x1b\[[0-9;]*m//g' "/tmp/bore_$p.log" 2>/dev/null | grep -q "bore.pub:$p"; then OK=1; break; fi
+            sleep 1
+          done
+          if [ "$OK" != "1" ]; then
+            echo "::error::bore could not open port $p (taken or bore.pub down). Change the port input and re-run."
+            cat "/tmp/bore_$p.log" || true
+            exit 1
+          fi
+        done
+        echo "Tunnel OK -> ${TUNNEL_HOST}:${MC_PORT}"
+
+    - name: Start frp tunnel
+      if: ${{ inputs.tunnel == 'frp' }}
+      run: |
+        set -e
+        [ -n "${{ secrets.FRP_SERVER }}" ] && [ -n "$FRP_TOKEN" ] || { echo "::error::Secrets FRP_SERVER and FRP_TOKEN are required for tunnel=frp"; exit 1; }
+        curl -fsSL "https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_linux_amd64.tar.gz" | tar xz
+        sudo install -m 755 "frp_${FRP_VERSION}_linux_amd64/frpc" /usr/local/bin/frpc
+
+        cat > frpc.toml << EOF
+        serverAddr = "${TUNNEL_HOST}"
+        serverPort = ${FRP_PORT}
+        auth.method = "token"
+        auth.token = "${FRP_TOKEN}"
+        log.to = "/tmp/frpc.log"
+
+        [[proxies]]
+        name = "minecraft"
+        type = "tcp"
+        localIP = "127.0.0.1"
+        localPort = 25565
+        remotePort = ${MC_PORT}
+        EOF
+        if [ "${{ inputs.with_panel }}" = "true" ]; then
+          cat >> frpc.toml << EOF
+
+        [[proxies]]
+        name = "panel"
+        type = "tcp"
+        localIP = "127.0.0.1"
+        localPort = 80
+        remotePort = ${PANEL_PORT}
+
+        [[proxies]]
+        name = "wings"
+        type = "tcp"
+        localIP = "127.0.0.1"
+        localPort = ${WINGS_PORT}
+        remotePort = ${WINGS_PORT}
+        EOF
+        fi
+        nohup frpc -c frpc.toml > /tmp/frpc.out 2>&1 &
+        for i in $(seq 1 20); do grep -q "start proxy success" /tmp/frpc.log 2>/dev/null && break; sleep 1; done
+        grep -q "start proxy success" /tmp/frpc.log || { echo "::error::frpc failed"; cat /tmp/frpc.log /tmp/frpc.out || true; exit 1; }
         echo "Tunnel OK -> ${TUNNEL_HOST}:${MC_PORT}"
 
     # ------------------------------------------------------------
@@ -361,7 +417,7 @@ jobs:
     - name: Keep alive (watchdog)
       run: |
         while true; do
-          pgrep -f tunnel.sh > /dev/null || { echo "tunnel supervisor died, restarting"; nohup ./tunnel.sh > /dev/null 2>&1 & }
+          if [ "${{ inputs.tunnel }}" = "frp" ]; then pgrep -x frpc > /dev/null || nohup frpc -c frpc.toml >> /tmp/frpc.out 2>&1 & fi
           if [ "${{ inputs.with_panel }}" != "true" ] && ! kill -0 "$(cat paper.pid)" 2>/dev/null; then
             echo "$(date -u) Paper stopped. Last log:"; tail -n 30 server.log
             exit 1
