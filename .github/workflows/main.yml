@@ -123,7 +123,7 @@ jobs:
       run: |
         set -e
         { echo "MC_PORT=$REQ_MC_PORT"; echo "PANEL_PORT=$REQ_PANEL_PORT"; echo "WINGS_PORT=$REQ_WINGS_PORT"; } >> "$GITHUB_ENV"
-        [ -n "${{ secrets.FRP_SERVER }}" ] && [ -n "$FRP_TOKEN" ] || { echo "::error::Secrets FRP_SERVER and FRP_TOKEN are required for tunnel=frp"; exit 1; }
+        [ -n "${{ secrets.FRP_SERVER }}" ] && [ -n "$FRP_TOKEN" ] || { echo "::error::tunnel=frp needs your own frp server. Add secrets FRP_SERVER and FRP_TOKEN, or pick tunnel=bore (no setup)."; exit 1; }
         curl -fsSL "https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_linux_amd64.tar.gz" | tar xz
         sudo install -m 755 "frp_${FRP_VERSION}_linux_amd64/frpc" /usr/local/bin/frpc
 
@@ -168,7 +168,7 @@ jobs:
       if: ${{ inputs.tunnel == 'rathole' }}
       run: |
         set -e
-        [ -n "$TUNNEL_HOST" ] && [ -n "$RATHOLE_TOKEN" ] || { echo "::error::Secrets RATHOLE_HOST and RATHOLE_TOKEN are required for tunnel=rathole"; exit 1; }
+        [ -n "${{ secrets.RATHOLE_HOST }}" ] && [ -n "$RATHOLE_TOKEN" ] || { echo "::error::tunnel=rathole needs your own rathole server. Add secrets RATHOLE_HOST and RATHOLE_TOKEN, or pick tunnel=bore (no setup)."; exit 1; }
         { echo "MC_PORT=$REQ_MC_PORT"; echo "PANEL_PORT=$REQ_PANEL_PORT"; echo "WINGS_PORT=$REQ_WINGS_PORT"; } >> "$GITHUB_ENV"
         curl -fsSL -o rathole.zip "https://github.com/rapiz1/rathole/releases/download/v0.5.0/rathole-x86_64-unknown-linux-gnu.zip"
         unzip -o rathole.zip rathole && chmod +x rathole
