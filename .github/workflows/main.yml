@@ -21,9 +21,9 @@ on:
         options: [bore, frp]
         default: bore
       mc_port:
-        description: "Public TCP port on the tunnel host for Minecraft (change if taken)"
+        description: "Preferred public port (if taken, a free one is picked and printed in the log)"
         type: string
-        default: "25565"
+        default: "47310"
       panel_port:
         description: "Public port for the panel (only with_panel)"
         type: string
@@ -42,9 +42,9 @@ env:
   FRP_PORT: ${{ secrets.FRP_PORT || '7000' }}
   FRP_TOKEN: ${{ secrets.FRP_TOKEN }}
   TUNNEL_HOST: ${{ inputs.tunnel == 'frp' && secrets.FRP_SERVER || 'bore.pub' }}
-  MC_PORT: ${{ inputs.mc_port }}
-  PANEL_PORT: ${{ inputs.panel_port }}
-  WINGS_PORT: ${{ inputs.wings_port }}
+  REQ_MC_PORT: ${{ inputs.mc_port }}
+  REQ_PANEL_PORT: ${{ inputs.panel_port }}
+  REQ_WINGS_PORT: ${{ inputs.wings_port }}
   PANEL_PASS: ${{ secrets.PANEL_PASSWORD || 'ChangeMe-Panel123!' }}
   RAM_MB: ${{ inputs.ram_mb }}
 
@@ -77,32 +77,44 @@ jobs:
         EOF
         chmod +x bore_sup.sh
 
-        PORTS="${MC_PORT}"
-        nohup ./bore_sup.sh 25565 "$MC_PORT" "$PWD/bore" > /dev/null 2>&1 &
-        if [ "${{ inputs.with_panel }}" = "true" ]; then
-          nohup ./bore_sup.sh 80 "$PANEL_PORT" "$PWD/bore" > /dev/null 2>&1 &
-          nohup ./bore_sup.sh "$WINGS_PORT" "$WINGS_PORT" "$PWD/bore" > /dev/null 2>&1 &
-          PORTS="$PORTS $PANEL_PORT $WINGS_PORT"
-        fi
-
-        for p in $PORTS; do
-          OK=0
-          for i in $(seq 1 30); do
-            if sed 's/\x1b\[[0-9;]*m//g' "/tmp/bore_$p.log" 2>/dev/null | grep -q "bore.pub:$p"; then OK=1; break; fi
-            sleep 1
+        # open_port NAME LOCAL|same PREFERRED_PORT -> prints the port that was actually obtained
+        open_port() {
+          local name=$1 loc=$2 port=$3 L i t
+          for t in 1 2 3 4 5 6 7 8; do
+            L=$loc; [ "$loc" = "same" ] && L=$port
+            : > "/tmp/bore_$port.log"
+            nohup ./bore_sup.sh "$L" "$port" "$PWD/bore" > /dev/null 2>&1 &
+            for i in $(seq 1 10); do
+              if sed 's/\x1b\[[0-9;]*m//g' "/tmp/bore_$port.log" | grep -q "bore.pub:$port"; then
+                echo "$name -> bore.pub:$port" >&2
+                echo "$port"; return 0
+              fi
+              grep -q "port already in use" "/tmp/bore_$port.log" && break
+              sleep 1
+            done
+            echo "$name: port $port not available, trying another" >&2
+            pkill -f "bore_sup.sh $L $port " 2>/dev/null || true
+            pkill -f "local $L --to bore.pub --port $port" 2>/dev/null || true
+            port=$((RANDOM % 40000 + 20000))
           done
-          if [ "$OK" != "1" ]; then
-            echo "::error::bore could not open port $p (taken or bore.pub down). Change the port input and re-run."
-            cat "/tmp/bore_$p.log" || true
-            exit 1
-          fi
-        done
-        echo "Tunnel OK -> ${TUNNEL_HOST}:${MC_PORT}"
+          return 1
+        }
+
+        MC=$(open_port minecraft 25565 "$REQ_MC_PORT") || { echo "::error::bore.pub gave no free port (down?)"; exit 1; }
+        echo "MC_PORT=$MC" >> "$GITHUB_ENV"
+        if [ "${{ inputs.with_panel }}" = "true" ]; then
+          PP=$(open_port panel 80 "$REQ_PANEL_PORT") || { echo "::error::no panel port"; exit 1; }
+          WP=$(open_port wings same "$REQ_WINGS_PORT") || { echo "::error::no wings port"; exit 1; }
+          echo "PANEL_PORT=$PP" >> "$GITHUB_ENV"
+          echo "WINGS_PORT=$WP" >> "$GITHUB_ENV"
+        fi
+        echo "Tunnel OK -> ${TUNNEL_HOST}:${MC}"
 
     - name: Start frp tunnel
       if: ${{ inputs.tunnel == 'frp' }}
       run: |
         set -e
+        { echo "MC_PORT=$REQ_MC_PORT"; echo "PANEL_PORT=$REQ_PANEL_PORT"; echo "WINGS_PORT=$REQ_WINGS_PORT"; } >> "$GITHUB_ENV"
         [ -n "${{ secrets.FRP_SERVER }}" ] && [ -n "$FRP_TOKEN" ] || { echo "::error::Secrets FRP_SERVER and FRP_TOKEN are required for tunnel=frp"; exit 1; }
         curl -fsSL "https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_linux_amd64.tar.gz" | tar xz
         sudo install -m 755 "frp_${FRP_VERSION}_linux_amd64/frpc" /usr/local/bin/frpc
@@ -119,7 +131,7 @@ jobs:
         type = "tcp"
         localIP = "127.0.0.1"
         localPort = 25565
-        remotePort = ${MC_PORT}
+        remotePort = ${REQ_MC_PORT}
         EOF
         if [ "${{ inputs.with_panel }}" = "true" ]; then
           cat >> frpc.toml << EOF
@@ -129,20 +141,20 @@ jobs:
         type = "tcp"
         localIP = "127.0.0.1"
         localPort = 80
-        remotePort = ${PANEL_PORT}
+        remotePort = ${REQ_PANEL_PORT}
 
         [[proxies]]
         name = "wings"
         type = "tcp"
         localIP = "127.0.0.1"
-        localPort = ${WINGS_PORT}
-        remotePort = ${WINGS_PORT}
+        localPort = ${REQ_WINGS_PORT}
+        remotePort = ${REQ_WINGS_PORT}
         EOF
         fi
         nohup frpc -c frpc.toml > /tmp/frpc.out 2>&1 &
         for i in $(seq 1 20); do grep -q "start proxy success" /tmp/frpc.log 2>/dev/null && break; sleep 1; done
         grep -q "start proxy success" /tmp/frpc.log || { echo "::error::frpc failed"; cat /tmp/frpc.log /tmp/frpc.out || true; exit 1; }
-        echo "Tunnel OK -> ${TUNNEL_HOST}:${MC_PORT}"
+        echo "Tunnel OK -> ${TUNNEL_HOST}:${REQ_MC_PORT}"
 
     # ------------------------------------------------------------
     # 2. Paper jar
