@@ -585,6 +585,7 @@ jobs:
         SRV_IDENT=$(echo "$SRV" | jq -r '.attributes.identifier')
         [ "$SRV_UUID" != "null" ] && [ -n "$SRV_UUID" ] || { echo "::error::server creation failed"; echo "$SRV" | jq .; exit 1; }
         echo "SRV_IDENT=$SRV_IDENT" >> "$GITHUB_ENV"
+        echo "SRV_UUID=$SRV_UUID" >> "$GITHUB_ENV"
 
         DIR="/var/lib/pterodactyl/volumes/$SRV_UUID"
         for i in $(seq 1 60); do [ -d "$DIR" ] && break; sleep 2; done
@@ -612,34 +613,6 @@ jobs:
         [ "$CODE" = "204" ] || { echo "::error::start failed (HTTP $CODE)"; cat /tmp/power.json; exit 1; }
         echo "Pterodactyl server started."
 
-    - name: Give OP (panel mode)
-      if: ${{ inputs.with_panel }}
-      run: |
-        set -e
-        [ -n "$OP_PLAYER" ] || { echo "op_player empty, skipping"; exit 0; }
-        STATE=""
-        for i in $(seq 1 60); do
-          STATE=$(curl -s "http://127.0.0.1/api/client/servers/$SRV_IDENT/resources" \
-            -H "Authorization: Bearer $CLIENT_KEY" -H "Accept: application/json" | jq -r '.attributes.current_state' 2>/dev/null || true)
-          [ "$STATE" = "running" ] && break
-          sleep 5
-        done
-        [ "$STATE" = "running" ] || { echo "::warning::server not running yet, could not OP $OP_PLAYER"; exit 0; }
-        sleep 60   # let Paper + plugins finish loading
-        CODE=""
-        for i in $(seq 1 10); do
-          CODE=$(curl -s -o /tmp/cmd.json -w "%{http_code}" -X POST \
-            "http://127.0.0.1/api/client/servers/$SRV_IDENT/command" \
-            -H "Authorization: Bearer $CLIENT_KEY" -H "Accept: application/json" \
-            -H "Content-Type: application/json" -d "{\"command\":\"op $OP_PLAYER\"}" || true)
-          [ "$CODE" = "204" ] && break
-          sleep 10
-        done
-        if [ "$CODE" = "204" ]; then echo "Sent: op $OP_PLAYER"; else echo "::warning::could not send op command (HTTP $CODE)"; cat /tmp/cmd.json || true; fi
-
-    # ------------------------------------------------------------
-    # 4. info + watchdog
-    # ------------------------------------------------------------
     - name: Show connection info
       run: |
         echo "========================================================="
@@ -652,6 +625,46 @@ jobs:
         fi
         echo "========================================================="
 
+    - name: Give OP (panel mode)
+      if: ${{ inputs.with_panel }}
+      timeout-minutes: 20
+      run: |
+        [ -n "$OP_PLAYER" ] || { echo "op_player empty, skipping"; exit 0; }
+        LOG="/var/lib/pterodactyl/volumes/$SRV_UUID/logs/latest.log"
+        H=(-m 15 -H "Authorization: Bearer $CLIENT_KEY" -H "Accept: application/json" -H "Content-Type: application/json")
+
+        # wait until Paper really finished loading (reads the server log, prints progress)
+        echo "Waiting for Paper to finish loading (status every 10s, max 10 min)..."
+        READY=""
+        for i in $(seq 1 60); do
+          STATE=$(curl -s "${H[@]}" "http://127.0.0.1/api/client/servers/$SRV_IDENT/resources" | jq -r '.attributes.current_state' 2>/dev/null || true)
+          if sudo grep -q 'Done (' "$LOG" 2>/dev/null; then READY=1; break; fi
+          echo "  [$((i*10))s] server state: ${STATE:-unknown} - still loading"
+          sleep 10
+        done
+        [ -n "$READY" ] && echo "Paper finished loading." || echo "::warning::did not see 'Done' in the log after 10 min, trying op anyway"
+
+        CODE=""
+        for i in $(seq 1 6); do
+          CODE=$(curl -s -o /tmp/cmd.json -w "%{http_code}" -X POST \
+            "http://127.0.0.1/api/client/servers/$SRV_IDENT/command" "${H[@]}" \
+            -d "{\"command\":\"op $OP_PLAYER\"}" || true)
+          [ "$CODE" = "204" ] && break
+          echo "  op attempt $i failed (HTTP $CODE), retrying in 10s"; sleep 10
+        done
+        if [ "$CODE" = "204" ]; then
+          echo "Sent: op $OP_PLAYER"
+          sleep 4
+          echo "--- server log after op ---"
+          sudo tail -n 8 "$LOG" 2>/dev/null || true
+        else
+          echo "::warning::could not send op command (HTTP $CODE)"; cat /tmp/cmd.json || true
+        fi
+        exit 0
+
+    # ------------------------------------------------------------
+    # 4. info + watchdog
+    # ------------------------------------------------------------
     - name: Keep alive (watchdog)
       run: |
         LAST=""
