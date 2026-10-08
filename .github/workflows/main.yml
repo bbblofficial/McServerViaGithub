@@ -139,14 +139,6 @@ jobs:
           sudo chmod 0755 /usr/local/bin/wings
           sudo /usr/local/bin/wings version || true
 
-      # ------------------------------------------------------------
-      # Create API keys. Fixes vs. previous version:
-      #  - Namespace is Pterodactyl\, not App\
-      #  - Application keys need r_* permission columns set (default 0 => 403)
-      #  - The bearer token is identifier + token with NO separator
-      #  - Token is encrypted manually only if the model doesn't cast it
-      #  - Also creates a client (account) key to start the server later
-      # ------------------------------------------------------------
       - name: Create API keys (application + client)
         run: |
           set -e
@@ -167,7 +159,6 @@ jobs:
                   $plain = bin2hex(random_bytes(16));
                   $identifier = $prefix . substr(bin2hex(random_bytes(8)), 0, 11); // 16 chars
                   
-                  // FIX: Use forceFill instead of create() to bypass mass assignment constraints
                   $key = new $cls;
                   $key->forceFill(array_merge([
                       'user_id'     => 1,
@@ -231,6 +222,18 @@ jobs:
 
       - name: Create Location and Node
         run: |
+          # Start a second Cloudflare tunnel specifically for the Wings Daemon
+          cloudflared tunnel --url http://localhost:8080 > wings_cf.log 2>&1 &
+          
+          WINGS_URL=""
+          for i in $(seq 1 30); do
+            WINGS_URL=$(grep -oP 'https://\K(?!api\.)[a-z0-9-]+\.trycloudflare\.com' wings_cf.log | head -1 || true)
+            [ -n "$WINGS_URL" ] && break
+            sleep 2
+          done
+          [ -z "$WINGS_URL" ] && { echo "ERROR: no cloudflared URL for wings"; cat wings_cf.log; exit 1; }
+          echo "WINGS URL: https://$WINGS_URL"
+
           H_AUTH="Authorization: Bearer $API_KEY"
           H_ACC="Accept: application/json"
           H_CT="Content-Type: application/json"
@@ -238,49 +241,40 @@ jobs:
           LOC_RESP=$(curl -s -X POST "http://127.0.0.1/api/application/locations" \
             -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
             -d '{"short":"local","long":"Local"}')
-          echo "Location response: $LOC_RESP"
           LOC_ID=$(echo "$LOC_RESP" | jq -r '.attributes.id')
-          if [ "$LOC_ID" = "null" ] || [ -z "$LOC_ID" ]; then
-            echo "ERROR: could not create location"; exit 1
-          fi
-          echo "LOC_ID=$LOC_ID" >> "$GITHUB_ENV"
 
+          # Register Node with the Cloudflare URL, forcing the panel to generate wss:// links on port 443
           NODE_RESP=$(curl -s -X POST "http://127.0.0.1/api/application/nodes" \
             -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
             -d "{
               \"name\":\"Local Node\",
               \"location_id\":$LOC_ID,
-              \"fqdn\":\"127.0.0.1\",
-              \"scheme\":\"http\",
-              \"behind_proxy\":false,
+              \"fqdn\":\"$WINGS_URL\",
+              \"scheme\":\"https\",
+              \"behind_proxy\":true,
               \"memory\":4096,
               \"memory_overallocate\":0,
               \"disk\":20480,
               \"disk_overallocate\":0,
               \"upload_size\":100,
               \"daemon_sftp\":2022,
-              \"daemon_listen\":8080
+              \"daemon_listen\":443
             }")
-          echo "Node response: $NODE_RESP"
+            
           NODE_ID=$(echo "$NODE_RESP" | jq -r '.attributes.id')
-          if [ "$NODE_ID" = "null" ] || [ -z "$NODE_ID" ]; then
-            echo "ERROR: could not create node"; exit 1
-          fi
           echo "NODE_ID=$NODE_ID" >> "$GITHUB_ENV"
 
           curl -s "http://127.0.0.1/api/application/nodes/$NODE_ID/configuration" \
             -H "$H_AUTH" -H "$H_ACC" > /tmp/wings-config.json
-          if ! jq -e '.token and (.token | length > 0)' /tmp/wings-config.json > /dev/null; then
-            echo "ERROR: wings config has no token"; head -c 400 /tmp/wings-config.json; echo; exit 1
-          fi
 
       - name: Write Wings config and start Wings
         run: |
           set -e
-          # Wings talks to the panel locally instead of through the Cloudflare URL
-          # (JSON is valid YAML, so config.yml can hold it directly)
-          jq '.remote = "http://127.0.0.1"' /tmp/wings-config.json \
+          # Modify the JSON config so Wings listens locally on 8080 (which Cloudflare proxies to)
+          # but continues communicating with the panel via localhost
+          jq '.api.port = 8080 | .api.host = "0.0.0.0" | .remote = "http://127.0.0.1"' /tmp/wings-config.json \
             | sudo tee /etc/pterodactyl/config.yml > /dev/null
+            
           sudo mkdir -p /var/lib/pterodactyl/volumes
           sudo chmod 600 /etc/pterodactyl/config.yml
 
