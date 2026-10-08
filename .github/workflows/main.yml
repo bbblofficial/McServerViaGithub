@@ -20,30 +20,25 @@ jobs:
       - name: Accept Minecraft EULA
         run: echo "eula=true" > eula.txt
 
-      - name: Install Cloudflared
+      - name: Download and Start Playit.gg
         run: |
-          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared-linux-amd64.deb
-
-      - name: Start Cloudflared Tunnel
-        run: |
-          # Start Cloudflared pointing to the IPv4 Minecraft TCP port
-          cloudflared tunnel --url tcp://127.0.0.1:25565 --logfile tunnel.log &
+          # دانلود نسخه لینوکس Playit
+          wget -O playit https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-linux-amd64
+          chmod +x playit
           
-          # Wait for the tunnel to generate a URL
+          # اجرای Playit در پس‌زمینه و ذخیره لاگ‌ها
+          ./playit > playit.log 2>&1 &
+          
+          # صبر کردن برای ساخت لینک تایید
           sleep 10
           
           echo "========================================================="
-          echo "Minecraft Server is starting!"
-          echo "Your TryCloudflare URL:"
-          grep -oEo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log
+          echo "Playit.gg is running!"
+          echo "👇 CLICK THE LINK BELOW TO GET YOUR SERVER IP 👇"
+          grep -o 'https://playit.gg/claim/[a-zA-Z0-9]*' playit.log
           echo "========================================================="
-          echo "HOW TO CONNECT:"
-          echo "Because Cloudflare Quick Tunnels do not natively expose TCP ports,"
-          echo "players cannot type the HTTPS link directly into Minecraft."
-          echo "Players must install cloudflared on their PC and run:"
-          echo "cloudflared access tcp --hostname <YOUR_TUNNEL_URL> --url tcp://localhost:25565"
-          echo "Then, connect in Minecraft using: localhost:25565"
+          echo "After clicking the link, Playit will give you an IP (like something.auto.playit.gg:12345)"
+          echo "Players can put that IP directly into Minecraft to join!"
           echo "========================================================="
 
       - name: Start Paper Server
