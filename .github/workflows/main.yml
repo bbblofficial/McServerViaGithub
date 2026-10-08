@@ -22,18 +22,40 @@ jobs:
       - name: Accept Minecraft EULA
         run: echo "eula=true" > eula.txt
 
-      - name: Install bore and create TCP tunnel
+      # The original workflow never actually started the standalone server.
+      - name: Start standalone Paper 1.8.8 server
+        run: |
+          nohup java -Xms512M -Xmx1G -jar paper.jar nogui > server.log 2>&1 &
+          sleep 3
+          echo "Standalone Paper started (log: server.log)"
+
+      - name: Install bore and create TCP tunnels
         run: |
           wget -q https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
           tar xzf bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
           chmod +x bore
+
+          # Tunnel 1: standalone server (25565)
           ./bore local 25565 --to bore.pub > bore.log 2>&1 &
+          # Tunnel 2: Pterodactyl-managed server (25570)
+          ./bore local 25570 --to bore.pub > bore2.log 2>&1 &
           sleep 8
-          sed 's/\x1b\[[0-9;]*m//g' bore.log > bore.clean.log
-          PUBLIC_PORT=$(grep -oP 'listening at bore\.pub:\K[0-9]+' bore.clean.log | head -1)
-          [ -z "$PUBLIC_PORT" ] && PUBLIC_PORT=$(grep -oP 'remote_port=\K[0-9]+' bore.clean.log | head -1)
+
+          get_port() {
+            sed 's/\x1b\[[0-9;]*m//g' "$1" > "$1.clean"
+            P=$(grep -oP 'listening at bore\.pub:\K[0-9]+' "$1.clean" | head -1)
+            [ -z "$P" ] && P=$(grep -oP 'remote_port=\K[0-9]+' "$1.clean" | head -1)
+            echo "$P"
+          }
+
+          PORT1=$(get_port bore.log)
+          PORT2=$(get_port bore2.log)
+          echo "$PORT1" > /tmp/bore_standalone_port.txt
+          echo "$PORT2" > /tmp/bore_ptero_port.txt
+
           echo "========================================================="
-          echo "MINECRAFT SERVER (standalone): bore.pub:$PUBLIC_PORT"
+          echo "MINECRAFT SERVER (standalone):  bore.pub:$PORT1"
+          echo "MINECRAFT SERVER (Pterodactyl): bore.pub:$PORT2"
           echo "========================================================="
 
       - name: Install Dependencies (PHP, MariaDB, Nginx)
@@ -77,15 +99,27 @@ jobs:
           EOF
           expect install_panel.exp
 
+          # Fail early if the panel did not install
+          test -f /var/www/pterodactyl/.env || { echo "ERROR: panel .env missing, install failed"; exit 1; }
+
       - name: Start Cloudflare Quick Tunnel for Pterodactyl Panel
         run: |
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared-linux-amd64.deb
           cloudflared tunnel --url http://localhost:80 > cloudflared.log 2>&1 &
-          sleep 10
-          PANEL_URL=$(grep -oP 'https://\K[a-z0-9-]+\.trycloudflare\.com' cloudflared.log | head -1)
-          [ -z "$PANEL_URL" ] && { echo "ERROR: no cloudflared URL"; exit 1; }
-          sudo sed -i "s|APP_URL=http://127.0.0.1|APP_URL=https://$PANEL_URL|g" /var/www/pterodactyl/.env
+
+          PANEL_URL=""
+          for i in $(seq 1 30); do
+            PANEL_URL=$(grep -oP 'https://\K(?!api\.)[a-z0-9-]+\.trycloudflare\.com' cloudflared.log | head -1 || true)
+            [ -n "$PANEL_URL" ] && break
+            sleep 2
+          done
+          [ -z "$PANEL_URL" ] && { echo "ERROR: no cloudflared URL"; cat cloudflared.log; exit 1; }
+
+          sudo sed -i "s|^APP_URL=.*|APP_URL=https://$PANEL_URL|" /var/www/pterodactyl/.env
+          # Needed so the panel works correctly behind the HTTPS Cloudflare proxy
+          grep -q '^TRUSTED_PROXIES=' /var/www/pterodactyl/.env || echo 'TRUSTED_PROXIES=*' | sudo tee -a /var/www/pterodactyl/.env > /dev/null
+
           cd /var/www/pterodactyl && sudo -u www-data php artisan optimize:clear
           echo "$PANEL_URL" > /tmp/panel_url.txt
           echo "PANEL URL: https://$PANEL_URL"
@@ -96,72 +130,87 @@ jobs:
 
       - name: Install Docker and Wings
         run: |
-          curl -fsSL https://get.docker.com | sudo sh
+          # Docker is preinstalled on GitHub runners; only install if missing
+          if ! command -v docker > /dev/null 2>&1; then
+            curl -fsSL https://get.docker.com | sudo sh
+          fi
           sudo systemctl start docker
           sudo systemctl enable docker
-
           sudo mkdir -p /etc/pterodactyl
-          sudo curl -L -o /usr/local/bin/wings \
+          sudo curl -fL -o /usr/local/bin/wings \
             "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_amd64"
           sudo chmod 0755 /usr/local/bin/wings
-          # Correct invocation is a subcommand, not a flag
           sudo /usr/local/bin/wings version || true
 
-      # ------------------------------------------------------------
-      # Create the application API key via the Eloquent model so that
-      # Laravel encrypts the token with the panel's APP_KEY (required
-      # by Pterodactyl 1.11+ where ApiKey::$casts['token']='encrypted').
-      # ------------------------------------------------------------
+      # Creates the application API key through Eloquent so Laravel encrypts
+      # the token with the panel's APP_KEY. Runs from the panel directory, as
+      # root (same as the installer's artisan commands), keeps stderr separate
+      # from the key, and prints the real exception if anything fails.
       - name: Create Application API Key via Eloquent
         id: apikey
         run: |
           set -e
-          sudo tee /tmp/mk-apikey.php > /dev/null << 'PHP'
+          sudo tee /var/www/pterodactyl/mk-apikey.php > /dev/null << 'PHP'
           <?php
-          require '/var/www/pterodactyl/vendor/autoload.php';
-          $app = require '/var/www/pterodactyl/bootstrap/app.php';
-          $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+          try {
+              require __DIR__ . '/vendor/autoload.php';
+              $app = require __DIR__ . '/bootstrap/app.php';
+              $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
 
-          use App\Models\ApiKey;
+              \App\Models\ApiKey::where('memo', 'automation')->delete();
 
-          // Clean up any previous automation key
-          ApiKey::where('memo', 'automation')->delete();
+              $plain = bin2hex(random_bytes(16));
+              $key = \App\Models\ApiKey::create([
+                  'user_id'     => 1,
+                  'key_type'    => \App\Models\ApiKey::TYPE_APPLICATION,
+                  'identifier'  => bin2hex(random_bytes(8)),
+                  'token'       => $plain,
+                  'memo'        => 'automation',
+                  'allowed_ips' => [],
+              ]);
 
-          // 32-hex plaintext token, 16-hex identifier. The model will
-          // encrypt `token` on save (1.11+) or hash it (<=1.10) as appropriate.
-          $plain = bin2hex(random_bytes(16));
-
-          $key = ApiKey::create([
-              'user_id'     => 1,
-              'key_type'    => ApiKey::TYPE_APPLICATION,  // = 2
-              'identifier'  => bin2hex(random_bytes(8)),
-              'token'       => $plain,
-              'memo'        => 'automation',
-              'allowed_ips' => [],
-          ]);
-
-          // Sanity log to help debug if auth ever breaks
-          fwrite(STDERR, sprintf(
-              "Created ApiKey id=%d type=%d identifier=%s raw_token_in_db=%s\n",
-              $key->id,
-              $key->key_type,
-              $key->identifier,
-              substr((string) $key->getRawOriginal('token'), 0, 20) . '...'
-          ));
-
-          echo $key->identifier . '.' . $plain . "\n";
+              echo $key->identifier . '.' . $plain . "\n";
+          } catch (Throwable $e) {
+              fwrite(STDERR, get_class($e) . ': ' . $e->getMessage() . "\n"
+                  . $e->getFile() . ':' . $e->getLine() . "\n");
+              exit(1);
+          }
           PHP
 
-          API_KEY=$(sudo -u www-data php /tmp/mk-apikey.php)
-          if [ -z "$API_KEY" ] || [ "${API_KEY#*.}" = "$API_KEY" ]; then
-            echo "ERROR: could not generate API key (got '$API_KEY')"
+          cd /var/www/pterodactyl
+          sudo chown -R www-data:www-data storage bootstrap/cache
+
+          set +e
+          sudo php -d display_errors=stderr mk-apikey.php > /tmp/mk-apikey.out 2> /tmp/mk-apikey.err
+          RC=$?
+          set -e
+
+          # Root may have created log files; give them back to www-data
+          sudo chown -R www-data:www-data storage bootstrap/cache
+          sudo rm -f mk-apikey.php
+
+          API_KEY=$(tail -n 1 /tmp/mk-apikey.out 2>/dev/null || true)
+
+          if [ "$RC" -ne 0 ] || ! echo "$API_KEY" | grep -qE '^[0-9a-f]{16}\.[0-9a-f]{32}$'; then
+            echo "ERROR: could not generate API key (exit code $RC)"
+            echo "----- stderr -----"; cat /tmp/mk-apikey.err || true
+            echo "----- stdout -----"; cat /tmp/mk-apikey.out || true
+            echo "----- DB settings (password hidden) -----"
+            sudo grep -E '^DB_' .env | sed 's/^\(DB_PASSWORD=\).*/\1***/' || true
+            echo "----- services -----"
+            systemctl is-active mariadb redis-server || true
+            echo "----- last panel log lines -----"
+            sudo tail -n 40 storage/logs/*.log 2>/dev/null || true
             exit 1
           fi
+
+          echo "::add-mask::$API_KEY"
           echo "API_KEY=$API_KEY" >> "$GITHUB_ENV"
-          echo "Generated API key: ${API_KEY:0:20}..."
+          echo "Generated API key: ${API_KEY:0:8}..."
 
       - name: Create Location and Node
         run: |
+          set -e
           H_AUTH="Authorization: Bearer $API_KEY"
           H_ACC="Accept: application/json"
           H_CT="Content-Type: application/json"
@@ -171,30 +220,34 @@ jobs:
             -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
             -d '{"short":"local","long":"Local"}')
           echo "Location response: $LOC_RESP"
-          LOC_ID=$(echo "$LOC_RESP" | jq -r '.attributes.id')
-          if [ "$LOC_ID" = "null" ] || [ -z "$LOC_ID" ]; then
+          LOC_ID=$(echo "$LOC_RESP" | jq -r '.attributes.id // empty')
+          if [ -z "$LOC_ID" ]; then
             echo "ERROR: could not create location"; exit 1
           fi
-          echo "Location id: $LOC_ID"
+          echo "LOCATION_ID=$LOC_ID" >> "$GITHUB_ENV"
 
           # Node
+          NODE_PAYLOAD=$(jq -n --argjson loc "$LOC_ID" '{
+            name: "Local Node",
+            location_id: $loc,
+            public: true,
+            fqdn: "127.0.0.1",
+            scheme: "http",
+            behind_proxy: false,
+            memory: 4096,
+            memory_overallocate: 0,
+            disk: 20480,
+            disk_overallocate: 0,
+            upload_size: 100,
+            daemon_base: "/var/lib/pterodactyl/volumes",
+            daemon_sftp: 2022,
+            daemon_listen: 8080
+          }')
           NODE_RESP=$(curl -s -X POST "http://127.0.0.1/api/application/nodes" \
-            -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
-            -d "{
-              \"name\":\"Local Node\",
-              \"location_id\":$LOC_ID,
-              \"fqdn\":\"127.0.0.1\",
-              \"scheme\":\"http\",
-              \"memory\":4096,
-              \"memory_overallocate\":0,
-              \"disk\":20480,
-              \"disk_overallocate\":0,
-              \"daemon_sftp\":2022,
-              \"daemon_listen\":8080
-            }")
+            -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" -d "$NODE_PAYLOAD")
           echo "Node response: $NODE_RESP"
-          NODE_ID=$(echo "$NODE_RESP" | jq -r '.attributes.id')
-          if [ "$NODE_ID" = "null" ] || [ -z "$NODE_ID" ]; then
+          NODE_ID=$(echo "$NODE_RESP" | jq -r '.attributes.id // empty')
+          if [ -z "$NODE_ID" ]; then
             echo "ERROR: could not create node"; exit 1
           fi
           echo "NODE_ID=$NODE_ID" >> "$GITHUB_ENV"
@@ -202,38 +255,39 @@ jobs:
           # Fetch Wings config
           curl -s "http://127.0.0.1/api/application/nodes/$NODE_ID/configuration" \
             -H "$H_AUTH" -H "$H_ACC" > /tmp/wings-config.json
-          echo "----- Wings config (head) -----"
-          head -c 400 /tmp/wings-config.json; echo
-          echo "-------------------------------"
-
           if ! jq -e '.token and (.token | length > 0)' /tmp/wings-config.json > /dev/null; then
-            echo "ERROR: wings config has no token"; exit 1
+            echo "ERROR: wings config has no token"
+            head -c 400 /tmp/wings-config.json; echo
+            exit 1
           fi
+          echo "Wings config fetched OK."
 
       - name: Write Wings config and start Wings
         run: |
           set -e
           jq '.remote = "http://127.0.0.1"' /tmp/wings-config.json \
             | sudo tee /etc/pterodactyl/config.yml > /dev/null
-
-          sudo mkdir -p /var/lib/pterodactyl/volumes
+          sudo mkdir -p /var/lib/pterodactyl/volumes /tmp/pterodactyl
           sudo chown -R root:root /etc/pterodactyl
           sudo chmod 600 /etc/pterodactyl/config.yml
 
           sudo nohup /usr/local/bin/wings --config /etc/pterodactyl/config.yml \
             > /tmp/wings.log 2>&1 &
           disown || true
-          sleep 8
-          echo "----- Wings log -----"
-          tail -n 40 /tmp/wings.log || true
-          echo "---------------------"
 
-          for i in $(seq 1 20); do
-            if curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/api/system | grep -q 200; then
-              echo "Wings is up."; break
+          # /api/system needs auth (401 without a token), so any HTTP reply means Wings is up
+          UP=0
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/api/system || true)
+            if [ "$CODE" != "000" ] && [ -n "$CODE" ]; then
+              echo "Wings is up (HTTP $CODE)."; UP=1; break
             fi
             sleep 2
           done
+          echo "----- Wings log -----"
+          tail -n 40 /tmp/wings.log || true
+          echo "---------------------"
+          if [ "$UP" -ne 1 ]; then echo "ERROR: Wings did not start"; exit 1; fi
 
       - name: Create Allocation and Server via API
         run: |
@@ -241,47 +295,85 @@ jobs:
           H_AUTH="Authorization: Bearer $API_KEY"
           H_ACC="Accept: application/json"
           H_CT="Content-Type: application/json"
+          API="http://127.0.0.1/api/application"
 
-          ALLOC_RESP=$(curl -s -X POST "http://127.0.0.1/api/application/nodes/$NODE_ID/allocations" \
+          # Allocation
+          ALLOC_RESP=$(curl -s -X POST "$API/nodes/$NODE_ID/allocations" \
             -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
             -d '{"ip":"0.0.0.0","ports":["25570"]}')
           echo "Allocation response: $ALLOC_RESP"
-          ALLOC_ID=$(curl -s "http://127.0.0.1/api/application/nodes/$NODE_ID/allocations" \
-            -H "$H_AUTH" -H "$H_ACC" | jq -r '.data[0].attributes.id')
+
+          ALLOC_ID=$(curl -s "$API/nodes/$NODE_ID/allocations" -H "$H_AUTH" -H "$H_ACC" \
+            | jq -r '[.data[] | select(.attributes.port==25570)][0].attributes.id // empty')
+          if [ -z "$ALLOC_ID" ]; then echo "ERROR: allocation not found"; exit 1; fi
           echo "Allocation ID: $ALLOC_ID"
 
-          EGG_ID=$(curl -s "http://127.0.0.1/api/application/nests/1/eggs" \
-            -H "$H_AUTH" -H "$H_ACC" | jq -r '.data[] | select(.attributes.name=="Paper") | .attributes.id')
+          # Paper egg (with its variables so we send exactly what the egg expects)
+          EGG_JSON=$(curl -s "$API/nests/1/eggs?include=variables" -H "$H_AUTH" -H "$H_ACC")
+          EGG_ID=$(echo "$EGG_JSON" | jq -r '[.data[] | select(.attributes.name=="Paper")][0].attributes.id // empty')
+          if [ -z "$EGG_ID" ]; then echo "ERROR: Paper egg not found"; echo "$EGG_JSON" | head -c 500; exit 1; fi
           echo "Paper egg id: $EGG_ID"
-          [ -z "$EGG_ID" ] || [ "$EGG_ID" = "null" ] && EGG_ID=1
 
-          SRV_JSON=$(curl -s -X POST "http://127.0.0.1/api/application/servers" \
-            -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
-            -d "{
-              \"name\":\"Paper 1.8.8\",
-              \"user\":1,
-              \"egg\":$EGG_ID,
-              \"docker_image\":\"ghcr.io/parkervcp/yolks:java_8\",
-              \"startup\":\"java -Xms128M -Xmx{{SERVER_MEMORY}}M -jar {{SERVER_JARFILE}}\",
-              \"environment\":{
-                \"SERVER_JARFILE\":\"server.jar\",
-                \"VANILLA_VERSION\":\"1.8.8\",
-                \"BUILD_NUMBER\":\"latest\"
-              },
-              \"limits\":{\"memory\":2048,\"swap\":0,\"disk\":10240,\"io\":500,\"cpu\":200},
-              \"feature_limits\":{\"databases\":0,\"backups\":0,\"allocations\":1},
-              \"allocation\":{\"default\":$ALLOC_ID},
-              \"deploy\":{\"locations\":[1],\"dedicated_ip\":false,\"port_range\":[]},
-              \"start_on_completion\":true
-            }")
-          echo "$SRV_JSON" | jq .
-          SRV_ID=$(echo "$SRV_JSON" | jq -r '.attributes.id')
+          STARTUP=$(echo "$EGG_JSON" | jq -r --argjson id "$EGG_ID" \
+            '[.data[] | select(.attributes.id==$id)][0].attributes.startup')
+
+          ENV_JSON=$(echo "$EGG_JSON" | jq -c --argjson id "$EGG_ID" '
+            [.data[] | select(.attributes.id==$id)][0].attributes.relationships.variables.data
+            | map({(.attributes.env_variable): (.attributes.default_value // "")})
+            | add
+            | .MINECRAFT_VERSION = "1.8.8"
+            | .SERVER_JARFILE = "server.jar"
+            | .BUILD_NUMBER = "latest"')
+          echo "Environment: $ENV_JSON"
+
+          SRV_PAYLOAD=$(jq -n \
+            --argjson egg "$EGG_ID" \
+            --argjson alloc "$ALLOC_ID" \
+            --arg startup "$STARTUP" \
+            --argjson env "$ENV_JSON" '{
+              name: "Paper 1.8.8",
+              user: 1,
+              egg: $egg,
+              docker_image: "ghcr.io/parkervcp/yolks:java_8",
+              startup: $startup,
+              environment: $env,
+              limits: {memory: 2048, swap: 0, disk: 10240, io: 500, cpu: 200},
+              feature_limits: {databases: 0, backups: 0, allocations: 1},
+              allocation: {default: $alloc},
+              start_on_completion: true
+            }')
+
+          SRV_JSON=$(curl -s -X POST "$API/servers" \
+            -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" -d "$SRV_PAYLOAD")
+          echo "$SRV_JSON" | jq . || echo "$SRV_JSON"
+
+          SRV_ID=$(echo "$SRV_JSON" | jq -r '.attributes.id // empty')
+          SRV_UUID=$(echo "$SRV_JSON" | jq -r '.attributes.uuid // empty')
+          if [ -z "$SRV_ID" ]; then echo "ERROR: server creation failed"; exit 1; fi
           echo "SERVER_ID=$SRV_ID" >> "$GITHUB_ENV"
+          echo "SERVER_UUID=$SRV_UUID" >> "$GITHUB_ENV"
+          echo "Pterodactyl server created (ID $SRV_ID, UUID $SRV_UUID)"
 
-          echo "========================================================="
-          echo "Pterodactyl server created (ID $SRV_ID)"
-          echo "Open the panel -> Servers to view / start it."
-          echo "========================================================="
+          # Wait for the egg install script to finish (status becomes null when done)
+          STATUS="installing"
+          for i in $(seq 1 90); do
+            STATUS=$(curl -s "$API/servers/$SRV_ID" -H "$H_AUTH" -H "$H_ACC" \
+              | jq -r '.attributes.status // "ready"')
+            echo "[$i] server status: $STATUS"
+            if [ "$STATUS" = "ready" ] || [ "$STATUS" = "install_failed" ]; then break; fi
+            sleep 5
+          done
+
+          # Fallback: if the egg install did not produce a jar, use the one we downloaded
+          VOL="/var/lib/pterodactyl/volumes/$SRV_UUID"
+          if [ -d "$VOL" ] && [ ! -f "$VOL/server.jar" ]; then
+            echo "server.jar missing in $VOL - copying local Paper jar as fallback"
+            OWN=$(sudo stat -c '%u:%g' "$VOL")
+            sudo cp paper.jar "$VOL/server.jar"
+            echo "eula=true" | sudo tee "$VOL/eula.txt" > /dev/null
+            sudo chown "$OWN" "$VOL/server.jar" "$VOL/eula.txt"
+            echo "Fallback applied. Press Start in the panel if the server is offline."
+          fi
 
       - name: Show panel + server info
         run: |
@@ -291,9 +383,9 @@ jobs:
           echo "  Email:    admin@example.com"
           echo "  Password: AdminPassword123!"
           echo ""
-          echo "Standalone Paper 1.8.8 is running at the bore.pub address"
-          echo "printed in the 'Install bore' step."
+          echo "Standalone Paper 1.8.8:      bore.pub:$(cat /tmp/bore_standalone_port.txt)"
+          echo "Pterodactyl Paper 1.8.8:     bore.pub:$(cat /tmp/bore_ptero_port.txt)"
           echo "========================================================="
 
-      - name: Keep job alive (tail Wings log)
-        run: tail -f /tmp/wings.log
+      - name: Keep job alive (tail logs)
+        run: tail -F /tmp/wings.log server.log
