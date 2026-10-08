@@ -1,4 +1,4 @@
-name: Paper 1.8.8 (bore.pub fully auto)
+name: Paper 1.8.8 (bore.pub)
 
 on:
   workflow_dispatch:
@@ -24,32 +24,43 @@ jobs:
 
       - name: Install bore and create TCP tunnel
         run: |
-          # Download bore (Rust binary, no deps)
           wget -q https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
           tar xzf bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
           chmod +x bore
 
-          # Start tunnel to localhost:25565, capture output
           ./bore local 25565 --to bore.pub > bore.log 2>&1 &
           sleep 8
 
-          echo "----- bore output -----"
+          echo "----- raw bore output -----"
           cat bore.log
-          echo "-----------------------"
+          echo "---------------------------"
 
-          # Extract the public port
-          PUBLIC_PORT=$(grep -oP 'remote_port=\K[0-9]+' bore.log | head -1)
+          # Strip ANSI escape codes -> plain text
+          sed 's/\x1b\[[0-9;]*m//g' bore.log > bore.clean.log
+
+          echo "----- clean bore output -----"
+          cat bore.clean.log
+          echo "-----------------------------"
+
+          # Extract port from "listening at bore.pub:58580"
+          PUBLIC_PORT=$(grep -oP 'listening at bore\.pub:\K[0-9]+' bore.clean.log | head -1)
+
+          # Fallback: parse "remote_port=58580"
           if [ -z "$PUBLIC_PORT" ]; then
-            echo "ERROR: Could not extract bore public port."
+            PUBLIC_PORT=$(grep -oP 'remote_port=\K[0-9]+' bore.clean.log | head -1)
+          fi
+
+          if [ -z "$PUBLIC_PORT" ]; then
+            echo "ERROR: could not extract bore public port."
             exit 1
           fi
 
           echo "========================================================="
           echo "SERVER ADDRESS: bore.pub:$PUBLIC_PORT"
           echo "========================================================="
-          echo "Players connect to:"
-          echo "  Host: bore.pub"
-          echo "  Port: $PUBLIC_PORT"
+          echo "In Minecraft multiplayer, add a server with:"
+          echo "  Server Address: bore.pub"
+          echo "  Port:           $PUBLIC_PORT"
           echo "========================================================="
 
       - name: Start Paper Server
