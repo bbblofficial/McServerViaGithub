@@ -15,7 +15,7 @@ jobs:
 
       - name: Download Paper 1.8.8 Build 445
         run: |
-          wget -O paper.jar https://api.papermc.io/v2/projects/paper/versions/1.8.8/builds/445/downloads/paper-1.8.8-445.jar
+          wget -O paper.jar https://fill-data.papermc.io/v1/objects/7ff6d2cec671ef0d95b3723b5c92890118fb882d73b7f8fa0a2cd31d97c55f86/paper-1.8.8-445.jar
 
       - name: Accept Minecraft EULA
         run: echo "eula=true" > eula.txt
