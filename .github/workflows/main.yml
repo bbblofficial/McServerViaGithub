@@ -16,14 +16,18 @@ on:
         type: string
         default: "2048"
       tunnel:
-        description: "bore = public bore.pub | bore-fallback = bore.pub then server_host | serveo = OpenSSH to serveo.net (Minecraft only). No secrets needed."
+        description: "bore = bore.pub | bore-fallback = bore.pub then server_host | serveo = OpenSSH to serveo.net (MC only) | frp = your own frps at server_host (MC only)"
         type: choice
-        options: [bore, bore-fallback, serveo]
+        options: [bore, bore-fallback, serveo, frp]
         default: bore
       server_host:
-        description: "Optional: another public bore server (used instead of bore.pub, or as fallback)"
+        description: "bore: another bore server | frp: address of YOUR frps server (required for frp)"
         type: string
         default: ""
+      frp_port:
+        description: "frp only: bindPort of your frps server"
+        type: string
+        default: "7000"
       mc_port:
         description: "Preferred public port (if taken, a free one is picked and printed in the log)"
         type: string
@@ -54,16 +58,26 @@ jobs:
 
     steps:
     # ------------------------------------------------------------
-    # 0. prepare (random panel password, no secrets used)
+    # 0. prepare: random panel password, open firewall, sanity checks
     # ------------------------------------------------------------
     - name: Prepare
       run: |
         set -e
         PW="$(openssl rand -hex 8)Aa1"
         echo "PANEL_PASS=$PW" >> "$GITHUB_ENV"
-        if [ "${{ inputs.with_panel }}" = "true" ] && [ "${{ inputs.tunnel }}" = "serveo" ]; then
-          echo "::error::serveo cannot be used with with_panel. Use tunnel=bore."; exit 1
+        if [ "${{ inputs.with_panel }}" = "true" ] && [ "${{ inputs.tunnel }}" != "bore" ] && [ "${{ inputs.tunnel }}" != "bore-fallback" ]; then
+          echo "::error::with_panel only works with bore or bore-fallback."; exit 1
         fi
+        if [ "${{ inputs.tunnel }}" = "frp" ] && [ -z "${{ inputs.server_host }}" ]; then
+          echo "::error::tunnel=frp needs server_host (your own frps server)."; exit 1
+        fi
+        # open the local firewall (runners normally have none, this is just to be sure)
+        sudo ufw disable 2>/dev/null || true
+        sudo iptables -P INPUT ACCEPT 2>/dev/null || true
+        sudo iptables -P FORWARD ACCEPT 2>/dev/null || true
+        sudo iptables -P OUTPUT ACCEPT 2>/dev/null || true
+        sudo iptables -F 2>/dev/null || true
+        echo "Firewall opened."
 
     # ------------------------------------------------------------
     # 1a. bore (public bore.pub, optional custom/fallback server)
@@ -111,7 +125,6 @@ jobs:
           return 1
         }
 
-        # choose host(s)
         CUSTOM="${{ inputs.server_host }}"
         if [ "${{ inputs.tunnel }}" = "bore-fallback" ]; then
           HOSTS="bore.pub ${CUSTOM}"
@@ -144,6 +157,15 @@ jobs:
       if: ${{ inputs.tunnel == 'serveo' }}
       run: |
         set -e
+        echo "--- reachability check for serveo.net:22 ---"
+        if timeout 10 bash -c 'cat < /dev/null > /dev/tcp/serveo.net/22' 2>/dev/null; then
+          echo "serveo.net:22 is reachable"
+        else
+          echo "serveo.net:22 is NOT reachable from this runner (service down or blocked)"
+        fi
+        mkdir -p ~/.ssh
+        [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519 -q
+
         cat > serveo_sup.sh << 'EOF'
         #!/bin/bash
         # usage: serveo_sup.sh REMOTE_PORT
@@ -151,7 +173,7 @@ jobs:
           tail -f /dev/null | ssh -T \
             -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
-            -o ExitOnForwardFailure=yes \
+            -o ExitOnForwardFailure=yes -o ConnectTimeout=15 \
             -R "$1:localhost:25565" serveo.net >> /tmp/serveo.log 2>&1
           echo "$(date -u) serveo exited, restarting" >> /tmp/serveo.log
           sleep 3
@@ -170,18 +192,71 @@ jobs:
             sleep 1
           done
           [ -n "$ADDR" ] && break
-          echo "serveo: port $PORT failed, trying another"
+          echo "serveo: port $PORT failed. Log of this attempt:"
+          cat /tmp/serveo.log || true
           pkill -f serveo_sup.sh 2>/dev/null || true
           pkill -f "ssh -T" 2>/dev/null || true
           PORT=$((RANDOM % 40000 + 20000))
         done
         if [ -z "$ADDR" ]; then
-          echo "::error::serveo did not return an address (service down?). Use tunnel=bore."
-          cat /tmp/serveo.log || true
+          echo "::error::serveo did not return an address (service down?). Use tunnel=bore or tunnel=frp."
           exit 1
         fi
         echo "PUBLIC_ADDR=$ADDR" >> "$GITHUB_ENV"
         echo "Tunnel OK -> $ADDR"
+
+    # ------------------------------------------------------------
+    # 1c. frp (open source, needs YOUR frps server, no token)
+    # ------------------------------------------------------------
+    - name: Start frp tunnel
+      if: ${{ inputs.tunnel == 'frp' }}
+      run: |
+        set -e
+        VER=$(curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+' || true)
+        [ -n "$VER" ] || VER="v0.61.1"
+        V="${VER#v}"
+        curl -fsSL "https://github.com/fatedier/frp/releases/download/${VER}/frp_${V}_linux_amd64.tar.gz" | tar xz
+        cp "frp_${V}_linux_amd64/frpc" ./frpc
+        chmod +x frpc
+
+        cat > frpc.toml << EOF
+        serverAddr = "${{ inputs.server_host }}"
+        serverPort = ${{ inputs.frp_port }}
+        loginFailExit = true
+
+        [[proxies]]
+        name = "minecraft-$RANDOM"
+        type = "tcp"
+        localIP = "127.0.0.1"
+        localPort = 25565
+        remotePort = ${REQ_MC_PORT}
+        EOF
+
+        cat > frp_sup.sh << 'EOF'
+        #!/bin/bash
+        while true; do
+          ./frpc -c frpc.toml >> /tmp/frpc.log 2>&1
+          echo "$(date -u) frpc exited, restarting" >> /tmp/frpc.log
+          sleep 3
+        done
+        EOF
+        chmod +x frp_sup.sh
+        : > /tmp/frpc.log
+        nohup ./frp_sup.sh > /dev/null 2>&1 &
+
+        OK=""
+        for i in $(seq 1 30); do
+          if grep -q "start proxy success" /tmp/frpc.log; then OK=1; break; fi
+          sleep 1
+        done
+        if [ -z "$OK" ]; then
+          echo "::error::frpc could not register the proxy (server unreachable, port not allowed, or auth token required)"
+          cat /tmp/frpc.log || true
+          exit 1
+        fi
+        echo "TUNNEL_HOST=${{ inputs.server_host }}" >> "$GITHUB_ENV"
+        echo "PUBLIC_ADDR=${{ inputs.server_host }}:${REQ_MC_PORT}" >> "$GITHUB_ENV"
+        echo "Tunnel OK -> ${{ inputs.server_host }}:${REQ_MC_PORT}"
 
     # ------------------------------------------------------------
     # 2. Paper jar
