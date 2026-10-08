@@ -29,27 +29,11 @@ jobs:
           chmod +x bore
           ./bore local 25565 --to bore.pub > bore.log 2>&1 &
           sleep 8
-          echo "----- raw bore output -----"
-          cat bore.log
-          echo "---------------------------"
           sed 's/\x1b\[[0-9;]*m//g' bore.log > bore.clean.log
-          echo "----- clean bore output -----"
-          cat bore.clean.log
-          echo "-----------------------------"
           PUBLIC_PORT=$(grep -oP 'listening at bore\.pub:\K[0-9]+' bore.clean.log | head -1)
-          if [ -z "$PUBLIC_PORT" ]; then
-            PUBLIC_PORT=$(grep -oP 'remote_port=\K[0-9]+' bore.clean.log | head -1)
-          fi
-          if [ -z "$PUBLIC_PORT" ]; then
-            echo "ERROR: could not extract bore public port."
-            exit 1
-          fi
+          [ -z "$PUBLIC_PORT" ] && PUBLIC_PORT=$(grep -oP 'remote_port=\K[0-9]+' bore.clean.log | head -1)
           echo "========================================================="
-          echo "SERVER ADDRESS: bore.pub:$PUBLIC_PORT"
-          echo "========================================================="
-          echo "In Minecraft multiplayer, add a server with:"
-          echo "  Server Address: bore.pub"
-          echo "  Port:           $PUBLIC_PORT"
+          echo "MINECRAFT SERVER (standalone): bore.pub:$PUBLIC_PORT"
           echo "========================================================="
 
       - name: Install Dependencies (PHP, MariaDB, Nginx)
@@ -58,7 +42,7 @@ jobs:
           sudo apt install -y software-properties-common curl apt-transport-https ca-certificates
           sudo LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php
           sudo apt update
-          sudo apt install -y php8.1 php8.1-{cli,gd,mysql,mbstring,bcmath,xml,fpm,curl,zip} mariadb-server nginx tar unzip git redis-server
+          sudo apt install -y php8.1 php8.1-{cli,gd,mysql,mbstring,bcmath,xml,fpm,curl,zip} mariadb-server nginx tar unzip git redis-server jq
 
       - name: Start MariaDB and Redis
         run: |
@@ -70,13 +54,9 @@ jobs:
           sudo apt-get install -y expect
           cat << 'EOF' > install_panel.exp
           set timeout 1800
-          log_user 1
-          log_file -a /tmp/install_panel.log
-
           spawn sudo bash -c "curl -s https://raw.githubusercontent.com/pterodactyl-installer/pterodactyl-installer/master/install.sh > /tmp/install.sh && bash /tmp/install.sh"
-
           expect {
-              timeout { puts "TIMEOUT: no matching prompt"; exit 1 }
+              timeout { puts "TIMEOUT"; exit 1 }
               -re {Input 0-6:}                                                    { send "0\r"; exp_continue }
               -re {Database name \(panel\):}                                      { send "\r"; exp_continue }
               -re {Database username \(pterodactyl\):}                            { send "\r"; exp_continue }
@@ -97,38 +77,189 @@ jobs:
           EOF
           expect install_panel.exp
 
-          # Sanity check that the install actually happened
-          if [ ! -d /var/www/pterodactyl ]; then
-            echo "ERROR: /var/www/pterodactyl does not exist - installation failed."
-            tail -n 100 /tmp/install_panel.log || true
-            exit 1
-          fi
-
       - name: Start Cloudflare Quick Tunnel for Pterodactyl Panel
         run: |
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared-linux-amd64.deb
           cloudflared tunnel --url http://localhost:80 > cloudflared.log 2>&1 &
           sleep 10
-          echo "----- Cloudflare Tunnel Output -----"
-          cat cloudflared.log
-          echo "------------------------------------"
           PANEL_URL=$(grep -oP 'https://\K[a-z0-9-]+\.trycloudflare\.com' cloudflared.log | head -1)
-          if [ -z "$PANEL_URL" ]; then
-            echo "ERROR: Could not extract cloudflared URL."
-            exit 1
-          fi
-
-          # Inject the new Cloudflare Tunnel URL into Laravel's APP_URL configuration
+          [ -z "$PANEL_URL" ] && { echo "ERROR: no cloudflared URL"; exit 1; }
           sudo sed -i "s|APP_URL=http://127.0.0.1|APP_URL=https://$PANEL_URL|g" /var/www/pterodactyl/.env
           cd /var/www/pterodactyl && sudo -u www-data php artisan optimize:clear
+          echo "$PANEL_URL" > /tmp/panel_url.txt
+          echo "PANEL URL: https://$PANEL_URL"
+
+      # ============================================================
+      # NEW STEPS — Wings + Node + Server
+      # ============================================================
+
+      - name: Install Docker and Wings
+        run: |
+          # Docker
+          curl -fsSL https://get.docker.com | sudo sh
+          sudo systemctl start docker
+          sudo systemctl enable docker
+
+          # Wings binary
+          sudo mkdir -p /etc/pterodactyl
+          sudo curl -L -o /usr/local/bin/wings \
+            "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_amd64"
+          sudo chmod u+x /usr/local/bin/wings
+          /usr/local/bin/wings --version || true
+
+      - name: Create Application API Key
+        id: apikey
+        run: |
+          cd /var/www/pterodactyl
+          API_KEY=$(sudo -u www-data php artisan tinker --execute='
+            use Illuminate\Support\Str;
+            $id    = Str::random(16);
+            $token = Str::random(32);
+            \App\Models\ApiKey::create([
+                "user_id"     => 1,
+                "key_type"    => 0,
+                "identifier"  => $id,
+                "token"       => hash("sha256", $token),
+                "memo"        => "automation",
+                "allowed_ips" => json_encode([]),
+            ]);
+            echo $id . "." . $token;
+          ' 2>/dev/null | tail -n 1)
+          echo "API_KEY=$API_KEY" >> $GITHUB_ENV
+          echo "Got API key: ${API_KEY:0:20}..."
+
+      - name: Create Location and Node
+        id: node
+        run: |
+          set -e
+          H_AUTH="Authorization: Bearer $API_KEY"
+          H_ACC="Accept: application/json"
+          H_CT="Content-Type: application/json"
+
+          # Location (needed for node)
+          LOC_ID=$(curl -s -X POST "http://127.0.0.1/api/application/locations" \
+            -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
+            -d '{"short":"local","long":"Local"}' | jq -r '.attributes.id')
+          echo "Location: $LOC_ID"
+
+          # Node
+          NODE_JSON=$(curl -s -X POST "http://127.0.0.1/api/application/nodes" \
+            -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
+            -d "{
+              \"name\":\"Local Node\",
+              \"location_id\":$LOC_ID,
+              \"fqdn\":\"127.0.0.1\",
+              \"scheme\":\"http\",
+              \"memory\":4096,
+              \"memory_overallocate\":0,
+              \"disk\":20480,
+              \"disk_overallocate\":0,
+              \"daemon_sftp\":2022,
+              \"daemon_listen\":8080
+            }")
+          echo "$NODE_JSON" | jq .
+          NODE_ID=$(echo "$NODE_JSON" | jq -r '.attributes.id')
+          echo "NODE_ID=$NODE_ID" >> $GITHUB_ENV
+
+          # Fetch the auto-generated Wings config
+          curl -s "http://127.0.0.1/api/application/nodes/$NODE_ID/configuration" \
+            -H "$H_AUTH" -H "$H_ACC" > /tmp/wings-config.json
+          jq -r '.debug' /tmp/wings-config.json > /dev/null   # sanity check
+
+      - name: Write Wings config and start Wings
+        run: |
+          set -e
+          # Rewrite "remote" to localhost so Wings talks straight to nginx,
+          # not through the Cloudflare tunnel (faster + more reliable).
+          jq '.remote = "http://127.0.0.1"' /tmp/wings-config.json \
+            | sudo tee /etc/pterodactyl/config.yml > /dev/null
+          sudo mkdir -p /var/lib/pterodactyl/volumes
+          sudo chown -R root:root /etc/pterodactyl
+
+          # Start wings in the background
+          sudo /usr/local/bin/wings --config /etc/pterodactyl/config.yml > /tmp/wings.log 2>&1 &
+          sleep 8
+          echo "----- Wings log -----"
+          tail -n 40 /tmp/wings.log || true
+          echo "---------------------"
+
+          # Make sure Wings is actually listening
+          for i in $(seq 1 15); do
+            if curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/api/system | grep -q 200; then
+              echo "Wings is up."; break
+            fi
+            sleep 2
+          done
+
+      - name: Create Allocation and Server via API
+        run: |
+          set -e
+          H_AUTH="Authorization: Bearer $API_KEY"
+          H_ACC="Accept: application/json"
+          H_CT="Content-Type: application/json"
+
+          # Create an allocation on the node (25570 so we don't clash with the
+          # standalone Paper server on 25565)
+          curl -s -X POST "http://127.0.0.1/api/application/nodes/$NODE_ID/allocations" \
+            -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
+            -d '{"ip":"0.0.0.0","ports":["25570"]}' | jq .
+          ALLOC_ID=$(curl -s "http://127.0.0.1/api/application/nodes/$NODE_ID/allocations" \
+            -H "$H_AUTH" -H "$H_ACC" | jq -r '.data[0].attributes.id')
+          echo "Allocation ID: $ALLOC_ID"
+
+          # Find the Paper egg id
+          EGG_ID=$(curl -s "http://127.0.0.1/api/application/nests/1/eggs" \
+            -H "$H_AUTH" -H "$H_ACC" | jq -r '.data[] | select(.attributes.name=="Paper") | .attributes.id')
+          echo "Paper egg id: $EGG_ID"
+          [ -z "$EGG_ID" ] && EGG_ID=1
+
+          # Create the server
+          SRV_JSON=$(curl -s -X POST "http://127.0.0.1/api/application/servers" \
+            -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
+            -d "{
+              \"name\":\"Paper 1.8.8\",
+              \"user\":1,
+              \"egg\":$EGG_ID,
+              \"docker_image\":\"ghcr.io/parkervcp/yolks:java_8\",
+              \"startup\":\"java -Xms128M -Xmx{{SERVER_MEMORY}}M -jar {{SERVER_JARFILE}}\",
+              \"environment\":{
+                \"SERVER_JARFILE\":\"server.jar\",
+                \"VANILLA_VERSION\":\"1.8.8\",
+                \"BUILD_NUMBER\":\"latest\"
+              },
+              \"limits\":{\"memory\":2048,\"swap\":0,\"disk\":10240,\"io\":500,\"cpu\":200},
+              \"feature_limits\":{\"databases\":0,\"backups\":0,\"allocations\":1},
+              \"allocation\":{\"default\":$ALLOC_ID},
+              \"deploy\":{\"locations\":[1],\"dedicated_ip\":false,\"port_range\":[]},
+              \"start_on_completion\":true
+            }")
+          echo "$SRV_JSON" | jq .
+          SRV_ID=$(echo "$SRV_JSON" | jq -r '.attributes.id')
+          echo "SERVER_ID=$SRV_ID" >> $GITHUB_ENV
 
           echo "========================================================="
-          echo "PTERODACTYL PANEL URL: https://$PANEL_URL"
-          echo "ADMIN EMAIL: admin@example.com"
-          echo "ADMIN PASSWORD: AdminPassword123!"
+          echo "Pterodactyl server created (ID $SRV_ID)"
+          echo "It will be visible in the panel under 'Servers'."
           echo "========================================================="
-          echo "Use this URL and credentials to access your Pterodactyl Panel."
 
-      - name: Start Paper Server
-        run: java -Xms2G -Xmx2G -jar paper.jar nogui
+      - name: Show panel + server info
+        run: |
+          PANEL_URL=$(cat /tmp/panel_url.txt)
+          echo "========================================================="
+          echo "PTERODACTYL PANEL: https://$PANEL_URL"
+          echo "  Email:    admin@example.com"
+          echo "  Password: AdminPassword123!"
+          echo ""
+          echo "Pterodactyl-managed Paper 1.8.8 server:"
+          echo "  Port inside container: 25570 (on 127.0.0.1)"
+          echo "  View + start it from the panel: Servers -> Paper 1.8.8"
+          echo ""
+          echo "Standalone Paper 1.8.8 (already running):"
+          echo "  bore.pub tunnel (see earlier step output)"
+          echo "========================================================="
+
+      - name: Keep job alive (tail Wings log)
+        run: |
+          # This keeps the runner alive so Wings keeps running.
+          tail -f /tmp/wings.log
