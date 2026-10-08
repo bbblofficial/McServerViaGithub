@@ -15,10 +15,6 @@ on:
         description: "Automatically install EssentialsX"
         type: boolean
         default: true
-      ram_mb:
-        description: "RAM for Minecraft server in MB"
-        type: string
-        default: "2048"
       op_player:
         description: "Player to OP automatically (empty = nobody)"
         type: string
@@ -53,7 +49,6 @@ env:
   REQ_MC_PORT: ${{ inputs.mc_port }}
   REQ_PANEL_PORT: ${{ inputs.panel_port }}
   REQ_WINGS_PORT: ${{ inputs.wings_port }}
-  REQ_RAM_MB: ${{ inputs.ram_mb }}
   OP_PLAYER: ${{ inputs.op_player }}
   BORE_HOST: ${{ inputs.bore_server }}
   # Optional repository secrets (Settings > Secrets and variables > Actions):
@@ -88,14 +83,6 @@ jobs:
         if ! [[ "$BORE_HOST" =~ ^[A-Za-z0-9.-]+$ ]]; then
           echo "::error::bore_server must be a plain hostname."; exit 1
         fi
-
-        # keep RAM inside what a hosted runner can really give
-        RAM="$REQ_RAM_MB"
-        [[ "$RAM" =~ ^[0-9]+$ ]] || { echo "RAM value invalid, using 2048"; RAM=2048; }
-        if [ "${{ inputs.with_panel }}" = "true" ]; then MAXR=6000; else MAXR=12000; fi
-        [ "$RAM" -gt "$MAXR" ] && { echo "RAM $RAM MB too high for this mode, using $MAXR MB"; RAM="$MAXR"; }
-        [ "$RAM" -lt 512 ] && RAM=512
-        echo "MC_RAM=$RAM" >> "$GITHUB_ENV"
 
         sudo ufw disable 2>/dev/null || true
         sudo iptables -P INPUT ACCEPT 2>/dev/null || true
@@ -407,7 +394,7 @@ jobs:
         echo "eula=true" > eula.txt
         echo "online-mode=${{ inputs.online_mode }}" > server.properties
         echo "server-port=25565" >> server.properties
-        nohup java -Xms512M -Xmx${MC_RAM}M -jar paper.jar nogui < ../mc.in > ../server.log 2>&1 &
+        nohup java -Xms1G -XX:+UseG1GC -jar paper.jar nogui < ../mc.in > ../server.log 2>&1 &
         echo $! > ../paper.pid
         for i in $(seq 1 180); do
           grep -q 'Done (' ../server.log && break
@@ -450,6 +437,7 @@ jobs:
         spawn sudo bash -c "curl -fsSL https://raw.githubusercontent.com/pterodactyl-installer/pterodactyl-installer/master/install.sh -o /tmp/install.sh && bash /tmp/install.sh"
         expect {
             timeout { puts "TIMEOUT"; exit 1 }
+            -re {Continue with installation\? \(y/N\):}                         { send "y\r"; exp_continue }
             -re {Input 0-6:}                                                    { send "0\r"; exp_continue }
             -re {Database name \(panel\):}                                      { send "\r";  exp_continue }
             -re {Database username \(pterodactyl\):}                            { send "\r";  exp_continue }
@@ -462,11 +450,10 @@ jobs:
             -re {Last name for the initial admin account:}                      { send "User\r";  exp_continue }
             -re {Password for the initial admin account:}                       { send "$env(PANEL_PASS)\r"; exp_continue }
             -re {Set the FQDN of this panel}                                    { send "127.0.0.1\r"; exp_continue }
-            -re {(?i)Let'?s Encrypt.*\(y/N\):}                                  { send "n\r"; exp_continue }
-            -re {(?i)automatically configure.*HTTPS.*\(y/N\):}                  { send "n\r"; exp_continue }
+            -re {(?i)Let'?s Encrypt[^\n]*\(y/N\):}                              { send "n\r"; exp_continue }
+            -re {(?i)automatically configure[^\n]*HTTPS[^\n]*\(y/N\):}         { send "n\r"; exp_continue }
             -re {configure UFW \(firewall\)\? \(y/N\):}                         { send "N\r"; exp_continue }
             -re {anonymous telemetry data\? \(yes/no\) \[yes\]:}                { send "no\r"; exp_continue }
-            -re {Continue with installation\? \(y/N\):}                         { send "y\r"; exp_continue }
             eof
         }
         EOF
@@ -555,11 +542,11 @@ jobs:
           -d '{"short":"local","long":"Local"}' | jq -r '.attributes.id')
         [ "$LOC_ID" != "null" ] || { echo "::error::location failed"; exit 1; }
 
-        # node memory must be >= server memory, otherwise server creation is rejected
-        NODE_MEM=$((MC_RAM + 1024))
+        # server memory limit is 0 (unlimited), node just gets the runner's RAM
+        NODE_MEM=7000
         NODE_ID=$(curl -s -X POST http://127.0.0.1/api/application/nodes "${H[@]}" -d "{
           \"name\":\"Local Node\",\"location_id\":$LOC_ID,\"fqdn\":\"$TUNNEL_HOST\",\"scheme\":\"http\",
-          \"behind_proxy\":false,\"memory\":$NODE_MEM,\"memory_overallocate\":0,\"disk\":20480,
+          \"behind_proxy\":false,\"memory\":$NODE_MEM,\"memory_overallocate\":100,\"disk\":20480,
           \"disk_overallocate\":0,\"upload_size\":100,\"daemon_sftp\":2022,\"daemon_listen\":$WINGS_PORT}" \
           | jq -r '.attributes.id')
         [ "$NODE_ID" != "null" ] || { echo "::error::node failed"; exit 1; }
@@ -607,9 +594,9 @@ jobs:
         SRV=$(curl -s -X POST http://127.0.0.1/api/application/servers "${H[@]}" -d "{
           \"name\":\"Paper 1.8.8\",\"user\":1,\"node\":$NODE_ID,\"nest\":1,\"egg\":$EGG_ID,
           \"docker_image\":\"ghcr.io/parkervcp/yolks:java_8\",
-          \"startup\":\"java -Xms128M -Xmx{{SERVER_MEMORY}}M -jar {{SERVER_JARFILE}}\",
+          \"startup\":\"java -Xms1G -XX:+UseG1GC -jar {{SERVER_JARFILE}}\",
           \"environment\":{\"SERVER_JARFILE\":\"server.jar\",\"MINECRAFT_VERSION\":\"1.8.8\",\"MC_VERSION\":\"1.8.8\",\"BUILD_NUMBER\":\"445\",\"DL_PATH\":\"\"},
-          \"limits\":{\"memory\":$MC_RAM,\"swap\":0,\"disk\":10240,\"io\":500,\"cpu\":200},
+          \"limits\":{\"memory\":0,\"swap\":0,\"disk\":10240,\"io\":500,\"cpu\":200},
           \"feature_limits\":{\"databases\":0,\"backups\":0,\"allocations\":1},
           \"allocation\":{\"default\":$ALLOC_ID},\"skip_scripts\":true,\"start_on_completion\":false}")
         SRV_UUID=$(echo "$SRV" | jq -r '.attributes.uuid')
