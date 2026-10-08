@@ -91,7 +91,6 @@ jobs:
           }
           EOF
           expect install_panel.exp
-          # Fail early if the panel did not install
           test -f /var/www/pterodactyl/.env || { echo "ERROR: panel .env missing, install failed"; exit 1; }
 
       - name: Start Cloudflare Quick Tunnel for Pterodactyl Panel
@@ -107,10 +106,14 @@ jobs:
           done
           [ -z "$PANEL_URL" ] && { echo "ERROR: no cloudflared URL"; cat cloudflared.log; exit 1; }
           sudo sed -i "s|^APP_URL=.*|APP_URL=https://$PANEL_URL|" /var/www/pterodactyl/.env
-          # Needed so the panel works correctly behind the HTTPS Cloudflare proxy
-          grep -q '^TRUSTED_PROXIES=' /var/www/pterodactyl/.env || echo 'TRUSTED_PROXIES=*' | sudo tee -a /var/www/pterodactyl/.env > /dev/null
-          # Allow CORS from any origin on the Panel side (for browser WebSocket handshake)
-          grep -q '^APP_CORS_ALLOWED_ORIGINS=' /var/www/pterodactyl/.env || echo 'APP_CORS_ALLOWED_ORIGINS=*' | sudo tee -a /var/www/pterodactyl/.env > /dev/null
+          # Trust Cloudflare's proxy so HTTPS + real client IPs work
+          grep -q '^TRUSTED_PROXIES=' /var/www/pterodactyl/.env \
+            && sudo sed -i "s|^TRUSTED_PROXIES=.*|TRUSTED_PROXIES=*|" /var/www/pterodactyl/.env \
+            || echo 'TRUSTED_PROXIES=*' | sudo tee -a /var/www/pterodactyl/.env > /dev/null
+          # Allow browser CORS from the Cloudflare origin
+          grep -q '^APP_CORS_ALLOWED_ORIGINS=' /var/www/pterodactyl/.env \
+            && sudo sed -i "s|^APP_CORS_ALLOWED_ORIGINS=.*|APP_CORS_ALLOWED_ORIGINS=*|" /var/www/pterodactyl/.env \
+            || echo 'APP_CORS_ALLOWED_ORIGINS=*' | sudo tee -a /var/www/pterodactyl/.env > /dev/null
           cd /var/www/pterodactyl && sudo -u www-data php artisan optimize:clear
           echo "$PANEL_URL" > /tmp/panel_url.txt
           echo "PANEL URL: https://$PANEL_URL"
@@ -159,7 +162,7 @@ jobs:
                       'allowed_ips' => [],
                   ], $extra));
                   $key->save();
-                  return $identifier . $plain; // bearer token: identifier + token, no separator
+                  return $identifier . $plain;
               };
               $rw = 3; // read + write
               $appKey = $make($cls::TYPE_APPLICATION, 'ptla_', [
@@ -192,7 +195,6 @@ jobs:
           echo "::add-mask::$CLIENT_KEY"
           echo "API_KEY=$API_KEY" >> "$GITHUB_ENV"
           echo "CLIENT_KEY=$CLIENT_KEY" >> "$GITHUB_ENV"
-          # Verify the application key actually authenticates
           CODE=$(curl -s -o /tmp/verify.json -w "%{http_code}" "http://127.0.0.1/api/application/locations" \
             -H "Authorization: Bearer $API_KEY" -H "Accept: application/json")
           echo "Application API check: HTTP $CODE"
@@ -204,9 +206,7 @@ jobs:
 
       - name: Create Location and Node
         run: |
-          # Start a second Cloudflare tunnel specifically for the Wings Daemon
           cloudflared tunnel --url http://localhost:8080 > wings_cf.log 2>&1 &
-          
           WINGS_URL=""
           for i in $(seq 1 30); do
             WINGS_URL=$(grep -oP 'https://\K(?!api\.)[a-z0-9-]+\.trycloudflare\.com' wings_cf.log | head -1 || true)
@@ -215,14 +215,17 @@ jobs:
           done
           [ -z "$WINGS_URL" ] && { echo "ERROR: no cloudflared URL for wings"; cat wings_cf.log; exit 1; }
           echo "WINGS URL: https://$WINGS_URL"
+          echo "WINGS_URL=$WINGS_URL" >> "$GITHUB_ENV"
+
           H_AUTH="Authorization: Bearer $API_KEY"
           H_ACC="Accept: application/json"
           H_CT="Content-Type: application/json"
+
           LOC_RESP=$(curl -s -X POST "http://127.0.0.1/api/application/locations" \
             -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
             -d '{"short":"local","long":"Local"}')
           LOC_ID=$(echo "$LOC_RESP" | jq -r '.attributes.id')
-          # Register Node with the Cloudflare URL, forcing the panel to generate wss:// links on port 443
+
           NODE_RESP=$(curl -s -X POST "http://127.0.0.1/api/application/nodes" \
             -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
             -d "{
@@ -239,7 +242,6 @@ jobs:
               \"daemon_sftp\":2022,
               \"daemon_listen\":443
             }")
-            
           NODE_ID=$(echo "$NODE_RESP" | jq -r '.attributes.id')
           echo "NODE_ID=$NODE_ID" >> "$GITHUB_ENV"
           curl -s "http://127.0.0.1/api/application/nodes/$NODE_ID/configuration" \
@@ -248,21 +250,31 @@ jobs:
       - name: Write Wings config and start Wings
         run: |
           set -e
-          # FIX: allowed_origins is a TOP-LEVEL key in Wings config, not under api.
-          # Setting it to ["*"] allows the WebSocket handshake from the Panel's
-          # Cloudflare tunnel origin, resolving the 403 "request origin not allowed" error.
-          jq '.api.port = 8080 | .api.host = "0.0.0.0" | .remote = "http://127.0.0.1" | .allowed_origins = ["*"]' /tmp/wings-config.json \
-            | sudo tee /etc/pterodactyl/config.yml > /dev/null
-            
+          # ── THE FIX ──────────────────────────────────────────────
+          # `allowed_origins` is a TOP-LEVEL key in Wings config.yml,
+          # NOT under `api`. Placing it at the top level allows the
+          # WebSocket handshake from the Panel's Cloudflare tunnel
+          # origin, resolving the 403 "request origin not allowed".
+          # ─────────────────────────────────────────────────────────
+          jq '.api.port = 8080
+              | .api.host = "0.0.0.0"
+              | .remote = "http://127.0.0.1"
+              | .allowed_origins = ["*"]' \
+            /tmp/wings-config.json | sudo tee /etc/pterodactyl/config.yml > /dev/null
+
+          # Sanity-check the resulting config
+          echo "----- Wings config (trimmed) -----"
+          sudo grep -E '^(api|allowed_origins|remote):|^\s+port:|^\s+host:' /etc/pterodactyl/config.yml || true
+
           sudo mkdir -p /var/lib/pterodactyl/volumes
           sudo chmod 600 /etc/pterodactyl/config.yml
           sudo nohup /usr/local/bin/wings --config /etc/pterodactyl/config.yml \
             > /tmp/wings.log 2>&1 &
           disown || true
+
           UP=0
           for i in $(seq 1 30); do
             CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/api/system || true)
-            # 401 is expected without a token; it means Wings is listening
             if [ "$CODE" = "200" ] || [ "$CODE" = "401" ]; then UP=1; break; fi
             sleep 2
           done
@@ -282,12 +294,12 @@ jobs:
             -H "$H_AUTH" -H "$H_ACC" | jq -r '.data[] | select(.attributes.port==25570) | .attributes.id' | head -1)
           echo "Allocation ID: $ALLOC_ID"
           [ -n "$ALLOC_ID" ] || { echo "ERROR: no allocation"; exit 1; }
+
           EGG_ID=$(curl -s "http://127.0.0.1/api/application/nests/1/eggs" \
             -H "$H_AUTH" -H "$H_ACC" | jq -r '.data[] | select(.attributes.name=="Paper") | .attributes.id')
           echo "Paper egg id: $EGG_ID"
           [ -n "$EGG_ID" ] && [ "$EGG_ID" != "null" ] || { echo "ERROR: Paper egg not found"; exit 1; }
-          # skip_scripts: don't run the egg's install script (it can't fetch 1.8.8);
-          # we drop in the already-downloaded paper.jar ourselves below.
+
           SRV_JSON=$(curl -s -X POST "http://127.0.0.1/api/application/servers" \
             -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
             -d "{
@@ -328,9 +340,8 @@ jobs:
           [ -d "$DIR" ] || { echo "ERROR: server directory not created"; tail -n 40 /tmp/wings.log; exit 1; }
           sudo cp paper.jar "$DIR/server.jar"
           echo "eula=true" | sudo tee "$DIR/eula.txt" > /dev/null
-          # Match ownership to what Wings created
           sudo chown --reference="$DIR" "$DIR/server.jar" "$DIR/eula.txt"
-          # Start via the client API (retry while the server finishes initialising)
+
           for i in $(seq 1 20); do
             CODE=$(curl -s -o /tmp/power.json -w "%{http_code}" -X POST \
               "http://127.0.0.1/api/client/servers/$SRV_IDENT/power" \
@@ -351,8 +362,9 @@ jobs:
           echo "  Email:    admin@example.com"
           echo "  Password: AdminPassword123!"
           echo ""
-          echo "Standalone Paper 1.8.8 and the Pterodactyl-managed server"
-          echo "use the bore.pub addresses printed in the bore step."
+          echo "WINGS URL:         https://$WINGS_URL"
+          echo "Standalone Paper 1.8.8 and the Pterodactyl-managed"
+          echo "server use the bore.pub addresses printed above."
           echo "========================================================="
 
       - name: Keep job alive (tail Wings log)
