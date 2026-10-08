@@ -96,55 +96,56 @@ jobs:
 
       - name: Install Docker and Wings
         run: |
-          # Docker
+          # Docker (already present on GH runners; the installer is idempotent)
           curl -fsSL https://get.docker.com | sudo sh
           sudo systemctl start docker
           sudo systemctl enable docker
 
-          # Wings binary
+          # Wings binary. 0755 so both root AND the runner user can execute it.
           sudo mkdir -p /etc/pterodactyl
           sudo curl -L -o /usr/local/bin/wings \
             "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_amd64"
-          sudo chmod u+x /usr/local/bin/wings
-          /usr/local/bin/wings --version || true
+          sudo chmod 0755 /usr/local/bin/wings
+          sudo /usr/local/bin/wings --version || true
 
-      - name: Create Application API Key
+      - name: Create Application API Key (direct DB insert)
         id: apikey
         run: |
-          cd /var/www/pterodactyl
-          API_KEY=$(sudo -u www-data php artisan tinker --execute='
-            use Illuminate\Support\Str;
-            $id    = Str::random(16);
-            $token = Str::random(32);
-            \App\Models\ApiKey::create([
-                "user_id"     => 1,
-                "key_type"    => 0,
-                "identifier"  => $id,
-                "token"       => hash("sha256", $token),
-                "memo"        => "automation",
-                "allowed_ips" => json_encode([]),
-            ]);
-            echo $id . "." . $token;
-          ' 2>/dev/null | tail -n 1)
-          echo "API_KEY=$API_KEY" >> $GITHUB_ENV
-          echo "Got API key: ${API_KEY:0:20}..."
+          set -e
+          # identifier: 16 hex chars. token: 32 hex chars. token stored as sha256 hash.
+          ID=$(openssl rand -hex 8)
+          TOKEN=$(openssl rand -hex 16)
+          HASHED=$(printf '%s' "$TOKEN" | sha256sum | awk '{print $1}')
+
+          # key_type = 1  =>  TYPE_APPLICATION
+          # user_id  = 1  =>  the admin user created by the installer (root_admin = 1)
+          sudo mysql panel -e "DELETE FROM api_keys WHERE memo='automation';"
+          sudo mysql panel -e "INSERT INTO api_keys \
+            (user_id, key_type, identifier, token, memo, allowed_ips, created_at, updated_at) \
+            VALUES (1, 1, '$ID', '$HASHED', 'automation', '[]', NOW(), NOW());"
+
+          echo "API_KEY=$ID.$TOKEN" >> "$GITHUB_ENV"
+          echo "Generated API key: ${ID:0:8}... (hash stored in DB)"
 
       - name: Create Location and Node
-        id: node
         run: |
-          set -e
           H_AUTH="Authorization: Bearer $API_KEY"
           H_ACC="Accept: application/json"
           H_CT="Content-Type: application/json"
 
-          # Location (needed for node)
-          LOC_ID=$(curl -s -X POST "http://127.0.0.1/api/application/locations" \
+          # Location
+          LOC_RESP=$(curl -s -X POST "http://127.0.0.1/api/application/locations" \
             -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
-            -d '{"short":"local","long":"Local"}' | jq -r '.attributes.id')
-          echo "Location: $LOC_ID"
+            -d '{"short":"local","long":"Local"}')
+          echo "Location response: $LOC_RESP"
+          LOC_ID=$(echo "$LOC_RESP" | jq -r '.attributes.id')
+          if [ "$LOC_ID" = "null" ] || [ -z "$LOC_ID" ]; then
+            echo "ERROR: could not create location"; exit 1
+          fi
+          echo "Location id: $LOC_ID"
 
           # Node
-          NODE_JSON=$(curl -s -X POST "http://127.0.0.1/api/application/nodes" \
+          NODE_RESP=$(curl -s -X POST "http://127.0.0.1/api/application/nodes" \
             -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
             -d "{
               \"name\":\"Local Node\",
@@ -158,34 +159,47 @@ jobs:
               \"daemon_sftp\":2022,
               \"daemon_listen\":8080
             }")
-          echo "$NODE_JSON" | jq .
-          NODE_ID=$(echo "$NODE_JSON" | jq -r '.attributes.id')
-          echo "NODE_ID=$NODE_ID" >> $GITHUB_ENV
+          echo "Node response: $NODE_RESP"
+          NODE_ID=$(echo "$NODE_RESP" | jq -r '.attributes.id')
+          if [ "$NODE_ID" = "null" ] || [ -z "$NODE_ID" ]; then
+            echo "ERROR: could not create node"; exit 1
+          fi
+          echo "NODE_ID=$NODE_ID" >> "$GITHUB_ENV"
 
-          # Fetch the auto-generated Wings config
+          # Fetch Wings config
           curl -s "http://127.0.0.1/api/application/nodes/$NODE_ID/configuration" \
             -H "$H_AUTH" -H "$H_ACC" > /tmp/wings-config.json
-          jq -r '.debug' /tmp/wings-config.json > /dev/null   # sanity check
+          echo "----- Wings config (head) -----"
+          head -c 400 /tmp/wings-config.json; echo
+          echo "-------------------------------"
+
+          # Sanity check: the config must contain a non-empty token
+          if ! jq -e '.token and (.token | length > 0)' /tmp/wings-config.json > /dev/null; then
+            echo "ERROR: wings config has no token"; exit 1
+          fi
 
       - name: Write Wings config and start Wings
         run: |
           set -e
-          # Rewrite "remote" to localhost so Wings talks straight to nginx,
-          # not through the Cloudflare tunnel (faster + more reliable).
+          # Rewrite "remote" to localhost so Wings talks straight to nginx.
           jq '.remote = "http://127.0.0.1"' /tmp/wings-config.json \
             | sudo tee /etc/pterodactyl/config.yml > /dev/null
+
           sudo mkdir -p /var/lib/pterodactyl/volumes
           sudo chown -R root:root /etc/pterodactyl
+          sudo chmod 600 /etc/pterodactyl/config.yml
 
-          # Start wings in the background
-          sudo /usr/local/bin/wings --config /etc/pterodactyl/config.yml > /tmp/wings.log 2>&1 &
+          # Detach Wings from the shell so it survives the step
+          sudo nohup /usr/local/bin/wings --config /etc/pterodactyl/config.yml \
+            > /tmp/wings.log 2>&1 &
+          disown || true
           sleep 8
           echo "----- Wings log -----"
           tail -n 40 /tmp/wings.log || true
           echo "---------------------"
 
-          # Make sure Wings is actually listening
-          for i in $(seq 1 15); do
+          # Wait for Wings HTTP API
+          for i in $(seq 1 20); do
             if curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/api/system | grep -q 200; then
               echo "Wings is up."; break
             fi
@@ -199,11 +213,12 @@ jobs:
           H_ACC="Accept: application/json"
           H_CT="Content-Type: application/json"
 
-          # Create an allocation on the node (25570 so we don't clash with the
-          # standalone Paper server on 25565)
-          curl -s -X POST "http://127.0.0.1/api/application/nodes/$NODE_ID/allocations" \
+          # Create an allocation on the node (25570 so we don't clash with
+          # the standalone Paper server on 25565)
+          ALLOC_RESP=$(curl -s -X POST "http://127.0.0.1/api/application/nodes/$NODE_ID/allocations" \
             -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
-            -d '{"ip":"0.0.0.0","ports":["25570"]}' | jq .
+            -d '{"ip":"0.0.0.0","ports":["25570"]}')
+          echo "Allocation response: $ALLOC_RESP"
           ALLOC_ID=$(curl -s "http://127.0.0.1/api/application/nodes/$NODE_ID/allocations" \
             -H "$H_AUTH" -H "$H_ACC" | jq -r '.data[0].attributes.id')
           echo "Allocation ID: $ALLOC_ID"
@@ -212,7 +227,7 @@ jobs:
           EGG_ID=$(curl -s "http://127.0.0.1/api/application/nests/1/eggs" \
             -H "$H_AUTH" -H "$H_ACC" | jq -r '.data[] | select(.attributes.name=="Paper") | .attributes.id')
           echo "Paper egg id: $EGG_ID"
-          [ -z "$EGG_ID" ] && EGG_ID=1
+          [ -z "$EGG_ID" ] || [ "$EGG_ID" = "null" ] && EGG_ID=1
 
           # Create the server
           SRV_JSON=$(curl -s -X POST "http://127.0.0.1/api/application/servers" \
@@ -236,11 +251,11 @@ jobs:
             }")
           echo "$SRV_JSON" | jq .
           SRV_ID=$(echo "$SRV_JSON" | jq -r '.attributes.id')
-          echo "SERVER_ID=$SRV_ID" >> $GITHUB_ENV
+          echo "SERVER_ID=$SRV_ID" >> "$GITHUB_ENV"
 
           echo "========================================================="
           echo "Pterodactyl server created (ID $SRV_ID)"
-          echo "It will be visible in the panel under 'Servers'."
+          echo "Open the panel -> Servers to view / start it."
           echo "========================================================="
 
       - name: Show panel + server info
@@ -251,15 +266,9 @@ jobs:
           echo "  Email:    admin@example.com"
           echo "  Password: AdminPassword123!"
           echo ""
-          echo "Pterodactyl-managed Paper 1.8.8 server:"
-          echo "  Port inside container: 25570 (on 127.0.0.1)"
-          echo "  View + start it from the panel: Servers -> Paper 1.8.8"
-          echo ""
-          echo "Standalone Paper 1.8.8 (already running):"
-          echo "  bore.pub tunnel (see earlier step output)"
+          echo "Standalone Paper 1.8.8 is running at the bore.pub address"
+          echo "printed in the 'Install bore' step."
           echo "========================================================="
 
       - name: Keep job alive (tail Wings log)
-        run: |
-          # This keeps the runner alive so Wings keeps running.
-          tail -f /tmp/wings.log
+        run: tail -f /tmp/wings.log
