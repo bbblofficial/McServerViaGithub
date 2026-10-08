@@ -1,4 +1,4 @@
-name: Paper 1.8.8 + optional Pterodactyl (frp fixed TCP)
+name: Paper 1.8.8 + optional Pterodactyl (serveo TCP, Actions only)
 
 on:
   workflow_dispatch:
@@ -15,16 +15,28 @@ on:
         description: "RAM for Minecraft server in MB"
         type: string
         default: "2048"
+      mc_port:
+        description: "Public port on serveo.net for Minecraft (change if taken)"
+        type: string
+        default: "25565"
+      panel_port:
+        description: "Public port for the panel (only with_panel)"
+        type: string
+        default: "8000"
+      wings_port:
+        description: "Public port for Wings (only with_panel)"
+        type: string
+        default: "8080"
 
 concurrency:
   group: minecraft-server
   cancel-in-progress: true
 
 env:
-  FRP_VERSION: "0.61.1"
-  FRP_SERVER: ${{ secrets.FRP_SERVER }}
-  FRP_PORT: ${{ secrets.FRP_PORT || '7000' }}
-  FRP_TOKEN: ${{ secrets.FRP_TOKEN }}
+  TUNNEL_HOST: serveo.net
+  MC_PORT: ${{ inputs.mc_port }}
+  PANEL_PORT: ${{ inputs.panel_port }}
+  WINGS_PORT: ${{ inputs.wings_port }}
   PANEL_PASS: ${{ secrets.PANEL_PASSWORD || 'ChangeMe-Panel123!' }}
   RAM_MB: ${{ inputs.ram_mb }}
 
@@ -35,70 +47,49 @@ jobs:
 
     steps:
     # ------------------------------------------------------------
-    # 0. sanity checks
+    # 1. TCP tunnel: plain OpenSSH -> serveo.net (no account, no secrets)
     # ------------------------------------------------------------
-    - name: Check secrets
-      run: |
-        [ -n "$FRP_SERVER" ] || { echo "::error::Secret FRP_SERVER is missing (your relay IP/domain)"; exit 1; }
-        [ -n "$FRP_TOKEN" ]  || { echo "::error::Secret FRP_TOKEN is missing"; exit 1; }
-        echo "::add-mask::$PANEL_PASS"
-
-    # ------------------------------------------------------------
-    # 1. fixed TCP tunnel (frp client -> your own frps relay)
-    # ------------------------------------------------------------
-    - name: Install and start frpc
+    - name: Start serveo TCP tunnel
       run: |
         set -e
-        curl -fsSL "https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_linux_amd64.tar.gz" | tar xz
-        sudo install -m 755 "frp_${FRP_VERSION}_linux_amd64/frpc" /usr/local/bin/frpc
-
-        cat > frpc.toml << EOF
-        serverAddr = "${FRP_SERVER}"
-        serverPort = ${FRP_PORT}
-        auth.method = "token"
-        auth.token = "${FRP_TOKEN}"
-        transport.tcpMux = true
-        log.to = "/tmp/frpc.log"
-        log.level = "info"
-
-        [[proxies]]
-        name = "minecraft"
-        type = "tcp"
-        localIP = "127.0.0.1"
-        localPort = 25565
-        remotePort = 25565
-        EOF
-
+        FWD="-R ${MC_PORT}:localhost:25565"
         if [ "${{ inputs.with_panel }}" = "true" ]; then
-          cat >> frpc.toml << EOF
-
-        [[proxies]]
-        name = "panel"
-        type = "tcp"
-        localIP = "127.0.0.1"
-        localPort = 80
-        remotePort = 8000
-
-        [[proxies]]
-        name = "wings"
-        type = "tcp"
-        localIP = "127.0.0.1"
-        localPort = 8080
-        remotePort = 8080
-        EOF
+          FWD="$FWD -R ${PANEL_PORT}:localhost:80 -R ${WINGS_PORT}:localhost:${WINGS_PORT}"
         fi
 
-        nohup frpc -c frpc.toml > /tmp/frpc.out 2>&1 &
-        for i in $(seq 1 20); do
-          if grep -q "start proxy success" /tmp/frpc.log 2>/dev/null; then break; fi
-          sleep 1
+        cat > tunnel.sh << EOF
+        #!/bin/bash
+        n=0
+        while true; do
+          n=\$((n+1))
+          if [ \$((n % 2)) -eq 1 ]; then P=22; else P=443; fi
+          echo "\$(date -u) connecting (ssh port \$P)" >> /tmp/tunnel.log
+          sleep infinity | ssh -T -p \$P \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            -o ExitOnForwardFailure=yes -o ConnectTimeout=15 \
+            $FWD ${TUNNEL_HOST} >> /tmp/tunnel.log 2>&1
+          echo "\$(date -u) tunnel dropped, reconnecting" >> /tmp/tunnel.log
+          sleep 3
         done
-        if ! grep -q "start proxy success" /tmp/frpc.log; then
-          echo "::error::frpc could not register proxies. Is frps running and are ports open?"
-          cat /tmp/frpc.log /tmp/frpc.out || true
+        EOF
+        chmod +x tunnel.sh
+        : > /tmp/tunnel.log
+        nohup ./tunnel.sh > /dev/null 2>&1 &
+
+        OK=0
+        for i in $(seq 1 30); do
+          sleep 2
+          if grep -qiE "forwarding tcp|tcp connections from" /tmp/tunnel.log; then OK=1; break; fi
+          if grep -qiE "already|in use|refused|denied|failed|administratively" /tmp/tunnel.log \
+             && [ "$i" -gt 10 ]; then break; fi
+        done
+        echo "----- tunnel.log -----"; cat /tmp/tunnel.log
+        if [ "$OK" != "1" ]; then
+          echo "::error::serveo tunnel did not come up (port ${MC_PORT} taken, or serveo is down). Try another mc_port."
           exit 1
         fi
-        echo "Tunnel OK -> ${FRP_SERVER}:25565"
+        echo "Tunnel OK -> ${TUNNEL_HOST}:${MC_PORT}"
 
     # ------------------------------------------------------------
     # 2. Paper jar
@@ -197,7 +188,7 @@ jobs:
         expect install_panel.exp
         test -f /var/www/pterodactyl/.env || { echo "::error::panel install failed"; exit 1; }
 
-        # accept any Host header, set public URL (through frp on port 8000)
+        # accept any Host header, set public URL (through the serveo tunnel)
         sudo rm -f /etc/nginx/sites-enabled/default || true
         for f in /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-available/pterodactyl; do
           [ -f "$f" ] && sudo sed -i -E 's/^([[:space:]]*server_name[[:space:]]+).*;/\1_;/' "$f"
@@ -206,7 +197,7 @@ jobs:
 
         ENV=/var/www/pterodactyl/.env
         setenv() { grep -q "^$1=" $ENV && sudo sed -i "s|^$1=.*|$1=$2|" $ENV || echo "$1=$2" | sudo tee -a $ENV > /dev/null; }
-        setenv APP_URL "http://${FRP_SERVER}:8000"
+        setenv APP_URL "http://${TUNNEL_HOST}:${PANEL_PORT}"
         setenv TRUSTED_PROXIES "*"
         setenv SESSION_SECURE_COOKIE "false"
         cd /var/www/pterodactyl && sudo -u www-data php artisan optimize:clear
@@ -280,21 +271,21 @@ jobs:
         [ "$LOC_ID" != "null" ] || { echo "::error::location failed"; exit 1; }
 
         NODE_ID=$(curl -s -X POST http://127.0.0.1/api/application/nodes "${H[@]}" -d "{
-          \"name\":\"Local Node\",\"location_id\":$LOC_ID,\"fqdn\":\"$FRP_SERVER\",\"scheme\":\"http\",
+          \"name\":\"Local Node\",\"location_id\":$LOC_ID,\"fqdn\":\"$TUNNEL_HOST\",\"scheme\":\"http\",
           \"behind_proxy\":false,\"memory\":4096,\"memory_overallocate\":0,\"disk\":20480,
-          \"disk_overallocate\":0,\"upload_size\":100,\"daemon_sftp\":2022,\"daemon_listen\":8080}" \
+          \"disk_overallocate\":0,\"upload_size\":100,\"daemon_sftp\":2022,\"daemon_listen\":$WINGS_PORT}" \
           | jq -r '.attributes.id')
         [ "$NODE_ID" != "null" ] || { echo "::error::node failed"; exit 1; }
         echo "NODE_ID=$NODE_ID" >> "$GITHUB_ENV"
 
         curl -s "http://127.0.0.1/api/application/nodes/$NODE_ID/configuration" "${H[@]}" > /tmp/wings.raw
-        sudo python3 - << 'PY'
+        sudo -E python3 - << 'PY'
         import yaml, json
         raw = open('/tmp/wings.raw').read()
         try: d = json.loads(raw)
         except Exception: d = yaml.safe_load(raw)
         d['api']['host'] = '0.0.0.0'
-        d['api']['port'] = 8080
+        d['api']['port'] = int(__import__('os').environ['WINGS_PORT'])
         d['remote'] = 'http://127.0.0.1'
         d['allowed_origins'] = ['*']
         open('/etc/pterodactyl/config.yml', 'w').write(yaml.safe_dump(d))
@@ -302,7 +293,7 @@ jobs:
         sudo chmod 600 /etc/pterodactyl/config.yml
         sudo nohup /usr/local/bin/wings --config /etc/pterodactyl/config.yml > /tmp/wings.log 2>&1 &
         for i in $(seq 1 30); do
-          CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/api/system || true)
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:${WINGS_PORT}/api/system || true)
           [ "$CODE" = "200" ] || [ "$CODE" = "401" ] && break
           sleep 2
         done
@@ -363,9 +354,9 @@ jobs:
     - name: Show connection info
       run: |
         echo "========================================================="
-        echo " MINECRAFT (1.8.8):  ${FRP_SERVER}:25565"
+        echo " MINECRAFT (1.8.8):  ${TUNNEL_HOST}:${MC_PORT}"
         if [ "${{ inputs.with_panel }}" = "true" ]; then
-          echo " PANEL:              http://${FRP_SERVER}:8000"
+          echo " PANEL:              http://${TUNNEL_HOST}:${PANEL_PORT}"
           echo " LOGIN:              admin@example.com / (PANEL_PASSWORD secret)"
         fi
         echo "========================================================="
@@ -373,10 +364,7 @@ jobs:
     - name: Keep alive (watchdog)
       run: |
         while true; do
-          if ! pgrep -x frpc > /dev/null; then
-            echo "$(date -u) frpc died, restarting"
-            nohup frpc -c frpc.toml >> /tmp/frpc.out 2>&1 &
-          fi
+          pgrep -f tunnel.sh > /dev/null || { echo "tunnel supervisor died, restarting"; nohup ./tunnel.sh > /dev/null 2>&1 & }
           if [ "${{ inputs.with_panel }}" != "true" ] && ! kill -0 "$(cat paper.pid)" 2>/dev/null; then
             echo "$(date -u) Paper stopped. Last log:"; tail -n 30 server.log
             exit 1
