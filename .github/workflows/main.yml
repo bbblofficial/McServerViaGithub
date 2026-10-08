@@ -16,12 +16,12 @@ on:
         type: string
         default: "2048"
       tunnel:
-        description: "auto = bore, then serveo, then pinggy | bore = bore.pub | serveo = serveo.net (ssh) | pinggy = pinggy.io (ssh). Panel needs bore or auto."
+        description: "auto = bore > openport > serveo > pinggy | bore = bore.pub (open source) | openport = openport.io (open-source client) | serveo / pinggy = free SSH services (closed servers). Panel needs bore or auto."
         type: choice
-        options: [auto, bore, serveo, pinggy]
+        options: [auto, bore, openport, serveo, pinggy]
         default: auto
       mc_port:
-        description: "Preferred public port (bore/serveo; if taken, a free one is picked and printed in the log)"
+        description: "Preferred public port (bore only; others pick their own and print it in the log)"
         type: string
         default: "47310"
       panel_port:
@@ -41,7 +41,7 @@ env:
   REQ_MC_PORT: ${{ inputs.mc_port }}
   REQ_PANEL_PORT: ${{ inputs.panel_port }}
   REQ_WINGS_PORT: ${{ inputs.wings_port }}
-  RAM_MB: ${{ inputs.ram_mb }}
+  REQ_RAM_MB: ${{ inputs.ram_mb }}
 
 jobs:
   run-server:
@@ -60,6 +60,16 @@ jobs:
         if [ "${{ inputs.with_panel }}" = "true" ] && [ "${{ inputs.tunnel }}" != "bore" ] && [ "${{ inputs.tunnel }}" != "auto" ]; then
           echo "::error::with_panel only works with tunnel=bore or tunnel=auto."; exit 1
         fi
+
+        # keep RAM inside what a hosted runner can really give
+        RAM="$REQ_RAM_MB"
+        if [ "${{ inputs.with_panel }}" = "true" ]; then MAXR=6000; else MAXR=12000; fi
+        if [ "$RAM" -gt "$MAXR" ] 2>/dev/null; then
+          echo "RAM $RAM MB is too high for this mode, using $MAXR MB"
+          RAM="$MAXR"
+        fi
+        echo "MC_RAM=$RAM" >> "$GITHUB_ENV"
+
         sudo ufw disable 2>/dev/null || true
         sudo iptables -P INPUT ACCEPT 2>/dev/null || true
         sudo iptables -P FORWARD ACCEPT 2>/dev/null || true
@@ -68,7 +78,7 @@ jobs:
         echo "Firewall opened."
 
     # ------------------------------------------------------------
-    # 1. public TCP tunnel (bore / serveo / pinggy / auto)
+    # 1. public TCP tunnel (bore / openport / serveo / pinggy / auto)
     # ------------------------------------------------------------
     - name: Start tunnel
       run: |
@@ -94,15 +104,15 @@ jobs:
 
         cat > serveo_sup.sh << 'EOF'
         #!/bin/bash
-        # usage: serveo_sup.sh REMOTE_PORT
+        # usage: serveo_sup.sh REMOTE_PORT   (0 = let serveo choose)
         while true; do
           tail -f /dev/null | ssh -T \
             -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
             -o ExitOnForwardFailure=yes -o ConnectTimeout=15 \
             -R "$1:localhost:25565" serveo.net >> /tmp/serveo.log 2>&1
-          echo "$(date -u) serveo exited, restarting" >> /tmp/serveo.log
-          sleep 3
+          echo "$(date -u) serveo exited, restarting in 20s" >> /tmp/serveo.log
+          sleep 20
         done
         EOF
 
@@ -114,8 +124,8 @@ jobs:
             -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
             -o ExitOnForwardFailure=yes -o ConnectTimeout=15 \
             -R0:localhost:25565 tcp@a.pinggy.io >> /tmp/pinggy.log 2>&1
-          echo "$(date -u) pinggy exited, restarting" >> /tmp/pinggy.log
-          sleep 3
+          echo "$(date -u) pinggy exited, restarting in 20s" >> /tmp/pinggy.log
+          sleep 20
         done
         EOF
         chmod +x bore_sup.sh serveo_sup.sh pinggy_sup.sh
@@ -165,25 +175,53 @@ jobs:
           return 0
         }
 
+        # ---------- openport (real open-source client from openport.io) ----------
+        try_openport() {
+          local i
+          if ! command -v openport > /dev/null 2>&1; then
+            wget -q -O /tmp/openport.deb https://openport.io/download/debian64/latest.deb || { echo "openport: download failed"; return 1; }
+            sudo dpkg -i /tmp/openport.deb > /tmp/openport_install.log 2>&1 || sudo apt-get install -f -y >> /tmp/openport_install.log 2>&1 || { echo "openport: install failed"; cat /tmp/openport_install.log; return 1; }
+          fi
+          command -v openport > /dev/null 2>&1 || { echo "openport: binary not found after install"; cat /tmp/openport_install.log 2>/dev/null || true; return 1; }
+          : > /tmp/openport.log
+          nohup openport 25565 > /tmp/openport.log 2>&1 &
+          for i in $(seq 1 45); do
+            ADDR=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/openport.log | grep -oE 'remote port [A-Za-z0-9.-]+:[0-9]{2,5}' | grep -oE '[A-Za-z0-9.-]+:[0-9]{2,5}$' | head -1 || true)
+            [ -n "$ADDR" ] && return 0
+            sleep 1
+          done
+          echo "openport: no address. Log:"; cat /tmp/openport.log || true
+          pkill -f "openport 25565" 2>/dev/null || true
+          return 1
+        }
+
         # ---------- serveo ----------
+        stop_serveo() {
+          pkill -f serveo_sup.sh 2>/dev/null || true
+          pkill -f "serveo.net" 2>/dev/null || true
+          pkill -x tail 2>/dev/null || true
+        }
+        serveo_once() {
+          local P=$1 i
+          : > /tmp/serveo.log
+          nohup ./serveo_sup.sh "$P" > /dev/null 2>&1 &
+          for i in $(seq 1 25); do
+            ADDR=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/serveo.log | grep -oE 'serveo\.net:[0-9]{2,5}' | head -1 || true)
+            [ -n "$ADDR" ] && return 0
+            grep -qE 'forwarding failed|timed out|refused|Permission denied' /tmp/serveo.log && break
+            sleep 1
+          done
+          echo "serveo (-R $P) failed. Log:"; cat /tmp/serveo.log || true
+          stop_serveo
+          return 1
+        }
         try_serveo() {
-          local PORT="$REQ_MC_PORT" t i
           if ! timeout 10 bash -c 'cat < /dev/null > /dev/tcp/serveo.net/22' 2>/dev/null; then
             echo "serveo.net:22 is not reachable (service down?)"; return 1
           fi
-          for t in 1 2 3; do
-            : > /tmp/serveo.log
-            nohup ./serveo_sup.sh "$PORT" > /dev/null 2>&1 &
-            for i in $(seq 1 20); do
-              ADDR=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/serveo.log | grep -oE 'serveo\.net:[0-9]{2,5}' | head -1 || true)
-              [ -n "$ADDR" ] && return 0
-              sleep 1
-            done
-            echo "serveo: port $PORT failed. Log:"; cat /tmp/serveo.log || true
-            pkill -f serveo_sup.sh 2>/dev/null || true
-            pkill -f "serveo.net" 2>/dev/null || true
-            PORT=$((RANDOM % 40000 + 20000))
-          done
+          serveo_once 0 && return 0
+          sleep 15
+          serveo_once "$REQ_MC_PORT" && return 0
           return 1
         }
 
@@ -195,6 +233,7 @@ jobs:
           for i in $(seq 1 30); do
             ADDR=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/pinggy.log | grep -oE 'tcp://[A-Za-z0-9.-]+:[0-9]{2,5}' | head -1 | sed 's#tcp://##' || true)
             [ -n "$ADDR" ] && return 0
+            grep -qE 'timed out|refused|Permission denied|forwarding failed' /tmp/pinggy.log && break
             sleep 1
           done
           echo "pinggy: no address. Log:"; cat /tmp/pinggy.log || true
@@ -209,12 +248,14 @@ jobs:
           try_bore && OK=1
         else
           case "$MODE" in
-            bore)   try_bore   && OK=1 ;;
-            serveo) try_serveo && OK=1 ;;
-            pinggy) try_pinggy && OK=1 ;;
+            bore)     try_bore     && OK=1 ;;
+            openport) try_openport && OK=1 ;;
+            serveo)   try_serveo   && OK=1 ;;
+            pinggy)   try_pinggy   && OK=1 ;;
             auto)
-              try_bore   && OK=1 || true
-              [ -n "$OK" ] || { echo ">> bore failed, trying serveo";  try_serveo && OK=1 || true; }
+              try_bore     && OK=1 || true
+              [ -n "$OK" ] || { echo ">> bore failed, trying openport"; try_openport && OK=1 || true; }
+              [ -n "$OK" ] || { echo ">> openport failed, trying serveo"; try_serveo && OK=1 || true; }
               [ -n "$OK" ] || { echo ">> serveo failed, trying pinggy"; try_pinggy && OK=1 || true; }
               ;;
           esac
@@ -263,7 +304,7 @@ jobs:
         echo "eula=true" > eula.txt
         echo "online-mode=${{ inputs.online_mode }}" > server.properties
         echo "server-port=25565" >> server.properties
-        nohup java -Xms512M -Xmx${RAM_MB}M -jar paper.jar nogui > ../server.log 2>&1 &
+        nohup java -Xms512M -Xmx${MC_RAM}M -jar paper.jar nogui > ../server.log 2>&1 &
         echo $! > ../paper.pid
         for i in $(seq 1 90); do
           grep -q 'Done (' ../server.log && break
@@ -454,7 +495,7 @@ jobs:
           \"docker_image\":\"ghcr.io/parkervcp/yolks:java_8\",
           \"startup\":\"java -Xms128M -Xmx{{SERVER_MEMORY}}M -jar {{SERVER_JARFILE}}\",
           \"environment\":{\"SERVER_JARFILE\":\"server.jar\",\"MC_VERSION\":\"1.8.8\",\"BUILD_NUMBER\":\"445\",\"DL_PATH\":\"\"},
-          \"limits\":{\"memory\":$RAM_MB,\"swap\":0,\"disk\":10240,\"io\":500,\"cpu\":200},
+          \"limits\":{\"memory\":$MC_RAM,\"swap\":0,\"disk\":10240,\"io\":500,\"cpu\":200},
           \"feature_limits\":{\"databases\":0,\"backups\":0,\"allocations\":1},
           \"allocation\":{\"default\":$ALLOC_ID},\"skip_scripts\":true,\"start_on_completion\":false}")
         SRV_UUID=$(echo "$SRV" | jq -r '.attributes.uuid')
@@ -502,13 +543,19 @@ jobs:
             echo "$(date -u) Paper stopped. Last log:"; tail -n 30 server.log
             exit 1
           fi
-          # pinggy free tunnels reconnect and can change address: print the current one
+          # free tunnels can reconnect on a new address: print the current one whenever it changes
+          CUR=""
           if [ -f /tmp/pinggy.log ]; then
-            CUR=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/pinggy.log | grep -oE 'tcp://[A-Za-z0-9.-]+:[0-9]{2,5}' | tail -1 | sed 's#tcp://##' || true)
-            if [ -n "$CUR" ] && [ "$CUR" != "$LAST" ]; then
-              echo "$(date -u) CURRENT MINECRAFT ADDRESS: $CUR"
-              LAST="$CUR"
-            fi
+            C=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/pinggy.log | grep -oE 'tcp://[A-Za-z0-9.-]+:[0-9]{2,5}' | tail -1 | sed 's#tcp://##' || true)
+            [ -n "$C" ] && CUR="$C"
+          fi
+          if [ -f /tmp/openport.log ]; then
+            C=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/openport.log | grep -oE 'remote port [A-Za-z0-9.-]+:[0-9]{2,5}' | grep -oE '[A-Za-z0-9.-]+:[0-9]{2,5}$' | tail -1 || true)
+            [ -n "$C" ] && CUR="$C"
+          fi
+          if [ -n "$CUR" ] && [ "$CUR" != "$LAST" ]; then
+            echo "$(date -u) CURRENT MINECRAFT ADDRESS: $CUR"
+            LAST="$CUR"
           fi
           sleep 30
         done
