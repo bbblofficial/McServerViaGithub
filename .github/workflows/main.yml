@@ -1,4 +1,4 @@
-name: Paper 1.8.8 + optional Pterodactyl (serveo TCP, Actions only)
+name: Paper 1.8.8 + optional Pterodactyl (sish open-source TCP tunnel)
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ on:
         type: string
         default: "2048"
       mc_port:
-        description: "Public port on serveo.net for Minecraft (change if taken)"
+        description: "Public TCP port on the tunnel host for Minecraft (change if taken)"
         type: string
         default: "25565"
       panel_port:
@@ -33,7 +33,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  TUNNEL_HOST: serveo.net
+  # sish = open-source (MIT) SSH tunnel server; ssi.sh is its public demo instance.
+  # Change to your own sish host or tuns.sh if you prefer.
+  TUNNEL_HOST: ssi.sh
   MC_PORT: ${{ inputs.mc_port }}
   PANEL_PORT: ${{ inputs.panel_port }}
   WINGS_PORT: ${{ inputs.wings_port }}
@@ -47,11 +49,12 @@ jobs:
 
     steps:
     # ------------------------------------------------------------
-    # 1. TCP tunnel: plain OpenSSH -> serveo.net (no account, no secrets)
+    # 1. public TCP tunnel: plain OpenSSH -> sish (open source)
     # ------------------------------------------------------------
-    - name: Start serveo TCP tunnel
+    - name: Start sish TCP tunnel
       run: |
         set -e
+        ssh-keygen -q -t ed25519 -N "" -f "$HOME/.ssh_tunnel_key"
         FWD="-R ${MC_PORT}:localhost:25565"
         if [ "${{ inputs.with_panel }}" = "true" ]; then
           FWD="$FWD -R ${PANEL_PORT}:localhost:80 -R ${WINGS_PORT}:localhost:${WINGS_PORT}"
@@ -62,31 +65,25 @@ jobs:
         n=0
         while true; do
           n=\$((n+1))
-          if [ \$((n % 2)) -eq 1 ]; then P=22; else P=443; fi
-          echo "\$(date -u) connecting (ssh port \$P)" >> /tmp/tunnel.log
-          sleep infinity | ssh -T -p \$P \
+          echo "\$(date -u) connecting (attempt \$n)" >> /tmp/tunnel.log
+          sleep infinity | ssh -T -i $HOME/.ssh_tunnel_key \
             -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
             -o ExitOnForwardFailure=yes -o ConnectTimeout=15 \
             $FWD ${TUNNEL_HOST} >> /tmp/tunnel.log 2>&1
           echo "\$(date -u) tunnel dropped, reconnecting" >> /tmp/tunnel.log
-          sleep 3
+          sleep 5
         done
         EOF
         chmod +x tunnel.sh
         : > /tmp/tunnel.log
         nohup ./tunnel.sh > /dev/null 2>&1 &
 
-        OK=0
-        for i in $(seq 1 30); do
-          sleep 2
-          if grep -qiE "forwarding tcp|tcp connections from" /tmp/tunnel.log; then OK=1; break; fi
-          if grep -qiE "already|in use|refused|denied|failed|administratively" /tmp/tunnel.log \
-             && [ "$i" -gt 10 ]; then break; fi
-        done
+        # ExitOnForwardFailure=yes: if ssh is still alive after 20 s, the ports were granted
+        sleep 20
         echo "----- tunnel.log -----"; cat /tmp/tunnel.log
-        if [ "$OK" != "1" ]; then
-          echo "::error::serveo tunnel did not come up (port ${MC_PORT} taken, or serveo is down). Try another mc_port."
+        if ! pgrep -f "ssh -T -i" > /dev/null || grep -qiE "denied|refused|already|in use|failed|not allowed" /tmp/tunnel.log; then
+          echo "::error::tunnel failed (port ${MC_PORT} taken, or ${TUNNEL_HOST} is down/limited). Try another mc_port or your own sish host."
           exit 1
         fi
         echo "Tunnel OK -> ${TUNNEL_HOST}:${MC_PORT}"
@@ -188,7 +185,7 @@ jobs:
         expect install_panel.exp
         test -f /var/www/pterodactyl/.env || { echo "::error::panel install failed"; exit 1; }
 
-        # accept any Host header, set public URL (through the serveo tunnel)
+        # accept any Host header, set public URL (through the tunnel)
         sudo rm -f /etc/nginx/sites-enabled/default || true
         for f in /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-available/pterodactyl; do
           [ -f "$f" ] && sudo sed -i -E 's/^([[:space:]]*server_name[[:space:]]+).*;/\1_;/' "$f"
