@@ -1,7 +1,7 @@
-name: Paper 1.8.8 Server
+name: Paper 1.8.8 Server (FRP)
 
 on:
-  workflow_dispatch: # Allows you to start the server manually from the Actions tab
+  workflow_dispatch:
 
 jobs:
   run-server:
@@ -15,30 +15,37 @@ jobs:
 
       - name: Download Paper 1.8.8 Build 445
         run: |
-          wget -O paper.jar https://fill-data.papermc.io/v1/objects/7ff6d2cec671ef0d95b3723b5c92890118fb882d73b7f8fa0a2cd31d97c55f86/paper-1.8.8-445.jar
+          wget -O paper.jar https://api.papermc.io/v2/projects/paper/versions/1.8.8/builds/445/downloads/paper-1.8.8-445.jar
 
       - name: Accept Minecraft EULA
         run: echo "eula=true" > eula.txt
 
-      - name: Download and Start Playit.gg
+      - name: Download and Configure FRP Client
         run: |
-          # دانلود نسخه لینوکس Playit
-          wget -O playit https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-linux-amd64
-          chmod +x playit
+          # دانلود آخرین نسخه FRP
+          wget -q https://github.com/fatedier/frp/releases/download/v0.58.1/frp_0.58.1_linux_amd64.tar.gz
+          tar -xzf frp_0.58.1_linux_amd64.tar.gz
+          mv frp_0.58.1_linux_amd64/frpc .
           
-          # اجرای Playit در پس‌زمینه و ذخیره لاگ‌ها
-          ./playit > playit.log 2>&1 &
+          # ساخت فایل کانفیگ برای وصل شدن به VPS شما
+          cat <<EOF > frpc.toml
+          serverAddr = "YOUR_VPS_IP_HERE"
+          serverPort = 7000
           
-          # صبر کردن برای ساخت لینک تایید
-          sleep 10
+          [[proxies]]
+          name = "minecraft-server"
+          type = "tcp"
+          localIP = "127.0.0.1"
+          localPort = 25565
+          remotePort = 25565
+          EOF
+          
+          # اجرای FRP در پس‌زمینه
+          ./frpc -c frpc.toml > frp.log 2>&1 &
           
           echo "========================================================="
-          echo "Playit.gg is running!"
-          echo "👇 CLICK THE LINK BELOW TO GET YOUR SERVER IP 👇"
-          grep -o 'https://playit.gg/claim/[a-zA-Z0-9]*' playit.log
-          echo "========================================================="
-          echo "After clicking the link, Playit will give you an IP (like something.auto.playit.gg:12345)"
-          echo "Players can put that IP directly into Minecraft to join!"
+          echo "FRP Client is running and connecting to your VPS..."
+          echo "Players can join using your VPS IP: YOUR_VPS_IP_HERE:25565"
           echo "========================================================="
 
       - name: Start Paper Server
