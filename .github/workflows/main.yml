@@ -1,557 +1,554 @@
 name: Paper 1.8.8 (bore.pub) with Pterodactyl Panel + Custom Dashboard
-
-on:
-  workflow_dispatch:
-
+on: workflow_dispatch:
 jobs:
   run-server:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
     steps:
-      - name: Setup Java 8
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '8'
+    - name: Setup Java 8
+      uses: actions/setup-java@v5
+      with:
+        distribution: temurin
+        java-version: '8'
 
-      - name: Download Paper 1.8.8 Build 445
-        run: |
-          wget -O paper.jar https://fill-data.papermc.io/v1/objects/7ff6d2cec671ef0d95b3723b5c92890118fb882d73b7f8fa0a2cd31d97c55f86/paper-1.8.8-445.jar
+    - name: Download Paper 1.8.8 Build 445
+      run: |
+        wget -O paper.jar https://fill-data.papermc.io/v1/objects/7ff6d2cec671ef0d95b3723b5c92890118fb882d73b7f8fa0a2cd31d97c55f86/paper-1.8.8-445.jar
 
-      - name: Accept Minecraft EULA
-        run: echo "eula=true" > eula.txt
+    - name: Accept Minecraft EULA
+      run: echo "eula=true" > eula.txt
 
-      - name: Start standalone Paper
-        run: |
-          nohup java -Xms512M -Xmx1G -jar paper.jar nogui > server.log 2>&1 &
-          sleep 3
-          echo "Standalone Paper started (log: server.log)"
-          echo "STANDALONE_WORKDIR=$PWD" >> "$GITHUB_ENV"
-          echo "JAVA_BIN=$(which java)" >> "$GITHUB_ENV"
+    - name: Start standalone Paper
+      run: |
+        nohup java -Xms512M -Xmx1G -jar paper.jar nogui > server.log 2>&1 &
+        sleep 3
+        echo "Standalone Paper started (log: server.log)"
+        echo "STANDALONE_WORKDIR=$PWD" >> "$GITHUB_ENV"
+        echo "JAVA_BIN=$(which java)" >> "$GITHUB_ENV"
 
-      - name: Install bore and create TCP tunnels
-        run: |
-          wget -q https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
-          tar xzf bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
-          chmod +x bore
-          ./bore local 25565 --to bore.pub > bore.log 2>&1 &
-          ./bore local 25570 --to bore.pub > bore2.log 2>&1 &
-          sleep 8
-          get_port() {
-            sed 's/\x1b\[[0-9;]*m//g' "$1" > "$1.clean"
-            P=$(grep -oP 'listening at bore\.pub:\K[0-9]+' "$1.clean" | head -1)
-            [ -z "$P" ] && P=$(grep -oP 'remote_port=\K[0-9]+' "$1.clean" | head -1)
-            echo "$P"
-          }
-          PORT1=$(get_port bore.log)
-          PORT2=$(get_port bore2.log)
-          echo "PORT1=$PORT1" >> "$GITHUB_ENV"
-          echo "PORT2=$PORT2" >> "$GITHUB_ENV"
-          echo "========================================================="
-          echo "MINECRAFT SERVER (standalone):  bore.pub:$PORT1"
-          echo "MINECRAFT SERVER (Pterodactyl): bore.pub:$PORT2"
-          echo "========================================================="
+    - name: Install bore and create TCP tunnels
+      run: |
+        wget -q https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
+        tar xzf bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
+        chmod +x bore
+        ./bore local 25565 --to bore.pub > bore.log 2>&1 &
+        ./bore local 25570 --to bore.pub > bore2.log 2>&1 &
+        sleep 8
+        get_port() {
+          sed 's/\x1b\[[0-9;]*m//g' "$1" > "$1.clean"
+          P=$(grep -oP 'listening at bore\.pub:\K[0-9]+' "$1.clean" | head -1)
+          [ -z "$P" ] && P=$(grep -oP 'remote_port=\K[0-9]+' "$1.clean" | head -1)
+          echo "$P"
+        }
+        PORT1=$(get_port bore.log)
+        PORT2=$(get_port bore2.log)
+        echo "PORT1=$PORT1" >> "$GITHUB_ENV"
+        echo "PORT2=$PORT2" >> "$GITHUB_ENV"
+        echo "========================================================="
+        echo "MINECRAFT SERVER (standalone):  bore.pub:$PORT1"
+        echo "MINECRAFT SERVER (Pterodactyl): bore.pub:$PORT2"
+        echo "========================================================="
 
-      - name: Install Dependencies (PHP, MariaDB, Nginx)
-        run: |
-          sudo apt update
-          sudo apt install -y software-properties-common curl apt-transport-https ca-certificates
-          sudo LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php
-          sudo apt update
-          sudo apt install -y php8.1 php8.1-{cli,gd,mysql,mbstring,bcmath,xml,fpm,curl,zip} mariadb-server nginx tar unzip git redis-server jq
+    - name: Install Dependencies (PHP, MariaDB, Nginx)
+      run: |
+        sudo apt update
+        sudo apt install -y software-properties-common curl apt-transport-https ca-certificates
+        sudo LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php
+        sudo apt update
+        sudo apt install -y php8.1 php8.1-{cli,gd,mysql,mbstring,bcmath,xml,fpm,curl,zip} mariadb-server nginx tar unzip git redis-server jq
 
-      - name: Start MariaDB and Redis
-        run: |
-          sudo systemctl start mariadb
-          sudo systemctl start redis-server
+    - name: Start MariaDB and Redis
+      run: |
+        sudo systemctl start mariadb
+        sudo systemctl start redis-server
 
-      - name: Install Pterodactyl Panel (Automated via Expect)
-        run: |
-          sudo apt-get install -y expect
-          cat << 'EOF' > install_panel.exp
-          set timeout 1800
-          spawn sudo bash -c "curl -s https://raw.githubusercontent.com/pterodactyl-installer/pterodactyl-installer/master/install.sh > /tmp/install.sh && bash /tmp/install.sh"
-          expect {
-              timeout { puts "TIMEOUT"; exit 1 }
-              -re {Input 0-6:}                                                    { send "0\r"; exp_continue }
-              -re {Database name \(panel\):}                                      { send "\r"; exp_continue }
-              -re {Database username \(pterodactyl\):}                            { send "\r"; exp_continue }
-              -re {Password \(press enter to use randomly generated password\):}  { send "\r"; exp_continue }
-              -re {Select timezone \[[^\]]*\]:}                                   { send "UTC\r"; exp_continue }
-              -re {Provide the email address that will be used to configure}      { send "admin@example.com\r"; exp_continue }
-              -re {Email address for the initial admin account:}                  { send "admin@example.com\r"; exp_continue }
-              -re {Username for the initial admin account:}                       { send "admin\r"; exp_continue }
-              -re {First name for the initial admin account:}                     { send "Admin\r"; exp_continue }
-              -re {Last name for the initial admin account:}                      { send "User\r"; exp_continue }
-              -re {Password for the initial admin account:}                       { send "AdminPassword123!\r"; exp_continue }
-              -re {Set the FQDN of this panel}                                    { send "127.0.0.1\r"; exp_continue }
-              -re {configure UFW \(firewall\)\? \(y/N\):}                         { send "N\r"; exp_continue }
-              -re {anonymous telemetry data\? \(yes/no\) \[yes\]:}                { send "no\r"; exp_continue }
-              -re {Continue with installation\? \(y/N\):}                         { send "y\r"; exp_continue }
-              eof
-          }
-          EOF
-          expect install_panel.exp
-          test -f /var/www/pterodactyl/.env || { echo "ERROR: panel .env missing, install failed"; exit 1; }
+    - name: Install Pterodactyl Panel (Automated via Expect)
+      run: |
+        sudo apt-get install -y expect
+        cat << 'EOF' > install_panel.exp
+        set timeout 1800
+        spawn sudo bash -c "curl -s https://raw.githubusercontent.com/pterodactyl-installer/pterodactyl-installer/master/install.sh > /tmp/install.sh && bash /tmp/install.sh"
+        expect {
+            timeout { puts "TIMEOUT"; exit 1 }
+            -re {Input 0-6:}                                                    { send "0\r"; exp_continue }
+            -re {Database name \(panel\):}                                      { send "\r"; exp_continue }
+            -re {Database username \(pterodactyl\):}                            { send "\r"; exp_continue }
+            -re {Password \(press enter to use randomly generated password\):}  { send "\r"; exp_continue }
+            -re {Select timezone \[[^\]]*\]:}                                   { send "UTC\r"; exp_continue }
+            -re {Provide the email address that will be used to configure}      { send "admin@example.com\r"; exp_continue }
+            -re {Email address for the initial admin account:}                  { send "admin@example.com\r"; exp_continue }
+            -re {Username for the initial admin account:}                       { send "admin\r"; exp_continue }
+            -re {First name for the initial admin account:}                     { send "Admin\r"; exp_continue }
+            -re {Last name for the initial admin account:}                      { send "User\r"; exp_continue }
+            -re {Password for the initial admin account:}                       { send "AdminPassword123!\r"; exp_continue }
+            -re {Set the FQDN of this panel}                                    { send "127.0.0.1\r"; exp_continue }
+            -re {configure UFW \(firewall\)\? \(y/N\):}                         { send "N\r"; exp_continue }
+            -re {anonymous telemetry data\? \(yes/no\) \[yes\]:}                { send "no\r"; exp_continue }
+            -re {Continue with installation\? \(y/N\):}                         { send "y\r"; exp_continue }
+            eof
+        }
+        EOF
+        expect install_panel.exp
+        test -f /var/www/pterodactyl/.env || { echo "ERROR: panel .env missing, install failed"; exit 1; }
 
-      - name: Start Cloudflare Quick Tunnel for Pterodactyl Panel
-        run: |
-          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared-linux-amd64.deb
-          cloudflared tunnel --url http://localhost:80 > cloudflared.log 2>&1 &
-          PANEL_URL=""
-          for i in $(seq 1 30); do
-            PANEL_URL=$(grep -oP 'https://\K(?!api\.)[a-z0-9-]+\.trycloudflare\.com' cloudflared.log | head -1 || true)
-            [ -n "$PANEL_URL" ] && break
-            sleep 2
-          done
-          [ -z "$PANEL_URL" ] && { echo "ERROR: no cloudflared URL"; cat cloudflared.log; exit 1; }
-          sudo sed -i "s|^APP_URL=.*|APP_URL=https://$PANEL_URL|" /var/www/pterodactyl/.env
-          grep -q '^TRUSTED_PROXIES=' /var/www/pterodactyl/.env \
-            && sudo sed -i "s|^TRUSTED_PROXIES=.*|TRUSTED_PROXIES=*|" /var/www/pterodactyl/.env \
-            || echo 'TRUSTED_PROXIES=*' | sudo tee -a /var/www/pterodactyl/.env > /dev/null
-          grep -q '^APP_CORS_ALLOWED_ORIGINS=' /var/www/pterodactyl/.env \
-            && sudo sed -i "s|^APP_CORS_ALLOWED_ORIGINS=.*|APP_CORS_ALLOWED_ORIGINS=*|" /var/www/pterodactyl/.env \
-            || echo 'APP_CORS_ALLOWED_ORIGINS=*' | sudo tee -a /var/www/pterodactyl/.env > /dev/null
-          cd /var/www/pterodactyl && sudo -u www-data php artisan optimize:clear
-          echo "$PANEL_URL" > /tmp/panel_url.txt
-          echo "PANEL_URL=$PANEL_URL" >> "$GITHUB_ENV"
-          echo "PANEL URL: https://$PANEL_URL"
+    - name: Start Cloudflare Quick Tunnel for Pterodactyl Panel
+      run: |
+        wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+        sudo dpkg -i cloudflared-linux-amd64.deb
+        cloudflared tunnel --url http://localhost:80 > cloudflared.log 2>&1 &
+        PANEL_URL=""
+        for i in $(seq 1 30); do
+          PANEL_URL=$(grep -oP 'https://\K(?!api\.)[a-z0-9-]+\.trycloudflare\.com' cloudflared.log | head -1 || true)
+          [ -n "$PANEL_URL" ] && break
+          sleep 2
+        done
+        [ -z "$PANEL_URL" ] && { echo "ERROR: no cloudflared URL"; cat cloudflared.log; exit 1; }
+        sudo sed -i "s|^APP_URL=.*|APP_URL=https://$PANEL_URL|" /var/www/pterodactyl/.env
+        grep -q '^TRUSTED_PROXIES=' /var/www/pterodactyl/.env \
+          && sudo sed -i "s|^TRUSTED_PROXIES=.*|TRUSTED_PROXIES=*|" /var/www/pterodactyl/.env \
+          || echo 'TRUSTED_PROXIES=*' | sudo tee -a /var/www/pterodactyl/.env > /dev/null
+        grep -q '^APP_CORS_ALLOWED_ORIGINS=' /var/www/pterodactyl/.env \
+          && sudo sed -i "s|^APP_CORS_ALLOWED_ORIGINS=.*|APP_CORS_ALLOWED_ORIGINS=*|" /var/www/pterodactyl/.env \
+          || echo 'APP_CORS_ALLOWED_ORIGINS=*' | sudo tee -a /var/www/pterodactyl/.env > /dev/null
+        cd /var/www/pterodactyl && sudo -u www-data php artisan optimize:clear
+        echo "$PANEL_URL" > /tmp/panel_url.txt
+        echo "PANEL_URL=$PANEL_URL" >> "$GITHUB_ENV"
+        echo "PANEL URL: https://$PANEL_URL"
 
-      - name: Install Docker and Wings
-        run: |
-          if ! command -v docker > /dev/null 2>&1; then
-            curl -fsSL https://get.docker.com | sudo sh
-          fi
-          sudo systemctl start docker
-          sudo systemctl enable docker
-          sudo mkdir -p /etc/pterodactyl
-          sudo curl -fL -o /usr/local/bin/wings \
-            "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_amd64"
-          sudo chmod 0755 /usr/local/bin/wings
-          sudo /usr/local/bin/wings version || true
+    - name: Install Docker and Wings
+      run: |
+        if ! command -v docker > /dev/null 2>&1; then
+          curl -fsSL https://get.docker.com | sudo sh
+        fi
+        sudo systemctl start docker
+        sudo systemctl enable docker
+        sudo mkdir -p /etc/pterodactyl
+        sudo curl -fL -o /usr/local/bin/wings \
+          "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_amd64"
+        sudo chmod 0755 /usr/local/bin/wings
+        sudo /usr/local/bin/wings version || true
 
-      - name: Create API keys (application + client)
-        run: |
-          set -e
-          sudo tee /tmp/mk-apikey.php > /dev/null << 'PHP'
-          <?php
-          try {
-              require '/var/www/pterodactyl/vendor/autoload.php';
-              $app = require '/var/www/pterodactyl/bootstrap/app.php';
-              $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
-              $cls = '\\Pterodactyl\\Models\\ApiKey';
-              $cls::where('memo', 'automation')->delete();
-              $casts = (new $cls)->getCasts();
-              $encrypted = isset($casts['token']) && $casts['token'] === 'encrypted';
-              $make = function (int $type, string $prefix, array $extra) use ($cls, $encrypted) {
-                  $plain = bin2hex(random_bytes(16));
-                  $identifier = $prefix . substr(bin2hex(random_bytes(8)), 0, 11);
-                  $key = new $cls;
-                  $key->forceFill(array_merge([
-                      'user_id'     => 1,
-                      'key_type'    => $type,
-                      'identifier'  => $identifier,
-                      'token'       => $encrypted ? $plain : \Illuminate\Support\Facades\Crypt::encrypt($plain),
-                      'memo'        => 'automation',
-                      'allowed_ips' => [],
-                  ], $extra));
-                  $key->save();
-                  return $identifier . $plain;
-              };
-              $rw = 3;
-              $appKey = $make($cls::TYPE_APPLICATION, 'ptla_', [
-                  'r_servers' => $rw, 'r_nodes' => $rw, 'r_allocations' => $rw,
-                  'r_users' => $rw, 'r_locations' => $rw, 'r_nests' => $rw,
-                  'r_eggs' => $rw, 'r_database_hosts' => $rw, 'r_server_databases' => $rw,
-              ]);
-              $clientKey = $make($cls::TYPE_ACCOUNT, 'ptlc_', []);
-              echo $appKey . "\n" . $clientKey . "\n";
-          } catch (Throwable $e) {
-              fwrite(STDERR, get_class($e) . ': ' . $e->getMessage() . "\n" . $e->getFile() . ':' . $e->getLine() . "\n");
-              exit(1);
-          }
-          PHP
-          cd /var/www/pterodactyl
-          set +e
-          sudo -u www-data php -d display_errors=stderr /tmp/mk-apikey.php > /tmp/mk-apikey.out 2> /tmp/mk-apikey.err
-          RC=$?
-          set -e
-          API_KEY=$(sed -n '1p' /tmp/mk-apikey.out)
-          CLIENT_KEY=$(sed -n '2p' /tmp/mk-apikey.out)
-          if [ "$RC" -ne 0 ] || [ -z "$API_KEY" ] || [ -z "$CLIENT_KEY" ]; then
-            echo "ERROR: could not generate API keys (exit code $RC)"
-            echo "----- stderr -----"; cat /tmp/mk-apikey.err || true
-            echo "----- stdout -----"; cat /tmp/mk-apikey.out || true
-            exit 1
-          fi
-          sudo rm -f /tmp/mk-apikey.php /tmp/mk-apikey.out
-          echo "::add-mask::$API_KEY"
-          echo "::add-mask::$CLIENT_KEY"
-          echo "API_KEY=$API_KEY" >> "$GITHUB_ENV"
-          echo "CLIENT_KEY=$CLIENT_KEY" >> "$GITHUB_ENV"
-          CODE=$(curl -s -o /tmp/verify.json -w "%{http_code}" "http://127.0.0.1/api/application/locations" \
-            -H "Authorization: Bearer $API_KEY" -H "Accept: application/json")
-          echo "Application API check: HTTP $CODE"
-          if [ "$CODE" != "200" ]; then
-            cat /tmp/verify.json; echo
-            sudo tail -n 30 /var/www/pterodactyl/storage/logs/*.log || true
-            exit 1
-          fi
+    - name: Create API keys (application + client)
+      run: |
+        set -e
+        sudo tee /tmp/mk-apikey.php > /dev/null << 'PHP'
+        <?php
+        try {
+            require '/var/www/pterodactyl/vendor/autoload.php';
+            $app = require '/var/www/pterodactyl/bootstrap/app.php';
+            $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+            $cls = '\\Pterodactyl\\Models\\ApiKey';
+            $cls::where('memo', 'automation')->delete();
+            $casts = (new $cls)->getCasts();
+            $encrypted = isset($casts['token']) && $casts['token'] === 'encrypted';
+            $make = function (int $type, string $prefix, array $extra) use ($cls, $encrypted) {
+                $plain = bin2hex(random_bytes(16));
+                $identifier = $prefix . substr(bin2hex(random_bytes(8)), 0, 11);
+                $key = new $cls;
+                $key->forceFill(array_merge([
+                    'user_id'     => 1,
+                    'key_type'    => $type,
+                    'identifier'  => $identifier,
+                    'token'       => $encrypted ? $plain : \Illuminate\Support\Facades\Crypt::encrypt($plain),
+                    'memo'        => 'automation',
+                    'allowed_ips' => [],
+                ], $extra));
+                $key->save();
+                return $identifier . $plain;
+            };
+            $rw = 3;
+            $appKey = $make($cls::TYPE_APPLICATION, 'ptla_', [
+                'r_servers' => $rw, 'r_nodes' => $rw, 'r_allocations' => $rw,
+                'r_users' => $rw, 'r_locations' => $rw, 'r_nests' => $rw,
+                'r_eggs' => $rw, 'r_database_hosts' => $rw, 'r_server_databases' => $rw,
+            ]);
+            $clientKey = $make($cls::TYPE_ACCOUNT, 'ptlc_', []);
+            echo $appKey . "\n" . $clientKey . "\n";
+        } catch (Throwable $e) {
+            fwrite(STDERR, get_class($e) . ': ' . $e->getMessage() . "\n" . $e->getFile() . ':' . $e->getLine() . "\n");
+            exit(1);
+        }
+        PHP
+        cd /var/www/pterodactyl
+        set +e
+        sudo -u www-data php -d display_errors=stderr /tmp/mk-apikey.php > /tmp/mk-apikey.out 2> /tmp/mk-apikey.err
+        RC=$?
+        set -e
+        API_KEY=$(sed -n '1p' /tmp/mk-apikey.out)
+        CLIENT_KEY=$(sed -n '2p' /tmp/mk-apikey.out)
+        if [ "$RC" -ne 0 ] || [ -z "$API_KEY" ] || [ -z "$CLIENT_KEY" ]; then
+          echo "ERROR: could not generate API keys (exit code $RC)"
+          echo "----- stderr -----"; cat /tmp/mk-apikey.err || true
+          echo "----- stdout -----"; cat /tmp/mk-apikey.out || true
+          exit 1
+        fi
+        sudo rm -f /tmp/mk-apikey.php /tmp/mk-apikey.out
+        echo "::add-mask::$API_KEY"
+        echo "::add-mask::$CLIENT_KEY"
+        echo "API_KEY=$API_KEY" >> "$GITHUB_ENV"
+        echo "CLIENT_KEY=$CLIENT_KEY" >> "$GITHUB_ENV"
+        CODE=$(curl -s -o /tmp/verify.json -w "%{http_code}" "http://127.0.0.1/api/application/locations" \
+          -H "Authorization: Bearer $API_KEY" -H "Accept: application/json")
+        echo "Application API check: HTTP $CODE"
+        if [ "$CODE" != "200" ]; then
+          cat /tmp/verify.json; echo
+          sudo tail -n 30 /var/www/pterodactyl/storage/logs/*.log || true
+          exit 1
+        fi
 
-      - name: Create Location and Node
-        run: |
-          cloudflared tunnel --url http://localhost:8080 > wings_cf.log 2>&1 &
-          WINGS_URL=""
-          for i in $(seq 1 30); do
-            WINGS_URL=$(grep -oP 'https://\K(?!api\.)[a-z0-9-]+\.trycloudflare\.com' wings_cf.log | head -1 || true)
-            [ -n "$WINGS_URL" ] && break
-            sleep 2
-          done
-          [ -z "$WINGS_URL" ] && { echo "ERROR: no cloudflared URL for wings"; cat wings_cf.log; exit 1; }
-          echo "WINGS URL: https://$WINGS_URL"
-          echo "WINGS_URL=$WINGS_URL" >> "$GITHUB_ENV"
-          H_AUTH="Authorization: Bearer $API_KEY"
-          H_ACC="Accept: application/json"
-          H_CT="Content-Type: application/json"
-          LOC_RESP=$(curl -s -X POST "http://127.0.0.1/api/application/locations" \
-            -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
-            -d '{"short":"local","long":"Local"}')
-          LOC_ID=$(echo "$LOC_RESP" | jq -r '.attributes.id')
-          NODE_RESP=$(curl -s -X POST "http://127.0.0.1/api/application/nodes" \
-            -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
-            -d "{
-              \"name\":\"Local Node\",
-              \"location_id\":$LOC_ID,
-              \"fqdn\":\"$WINGS_URL\",
-              \"scheme\":\"https\",
-              \"behind_proxy\":true,
-              \"memory\":4096,
-              \"memory_overallocate\":0,
-              \"disk\":20480,
-              \"disk_overallocate\":0,
-              \"upload_size\":100,
-              \"daemon_sftp\":2022,
-              \"daemon_listen\":443
-            }")
-          NODE_ID=$(echo "$NODE_RESP" | jq -r '.attributes.id')
-          echo "NODE_ID=$NODE_ID" >> "$GITHUB_ENV"
-          curl -s "http://127.0.0.1/api/application/nodes/$NODE_ID/configuration" \
-            -H "$H_AUTH" -H "$H_ACC" > /tmp/wings-config.json
+    - name: Create Location and Node
+      run: |
+        cloudflared tunnel --url http://localhost:8080 > wings_cf.log 2>&1 &
+        WINGS_URL=""
+        for i in $(seq 1 30); do
+          WINGS_URL=$(grep -oP 'https://\K(?!api\.)[a-z0-9-]+\.trycloudflare\.com' wings_cf.log | head -1 || true)
+          [ -n "$WINGS_URL" ] && break
+          sleep 2
+        done
+        [ -z "$WINGS_URL" ] && { echo "ERROR: no cloudflared URL for wings"; cat wings_cf.log; exit 1; }
+        echo "WINGS URL: https://$WINGS_URL"
+        echo "WINGS_URL=$WINGS_URL" >> "$GITHUB_ENV"
+        H_AUTH="Authorization: Bearer $API_KEY"
+        H_ACC="Accept: application/json"
+        H_CT="Content-Type: application/json"
+        LOC_RESP=$(curl -s -X POST "http://127.0.0.1/api/application/locations" \
+          -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
+          -d '{"short":"local","long":"Local"}')
+        LOC_ID=$(echo "$LOC_RESP" | jq -r '.attributes.id')
+        NODE_RESP=$(curl -s -X POST "http://127.0.0.1/api/application/nodes" \
+          -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
+          -d "{
+            \"name\":\"Local Node\",
+            \"location_id\":$LOC_ID,
+            \"fqdn\":\"$WINGS_URL\",
+            \"scheme\":\"https\",
+            \"behind_proxy\":true,
+            \"memory\":4096,
+            \"memory_overallocate\":0,
+            \"disk\":20480,
+            \"disk_overallocate\":0,
+            \"upload_size\":100,
+            \"daemon_sftp\":2022,
+            \"daemon_listen\":443
+          }")
+        NODE_ID=$(echo "$NODE_RESP" | jq -r '.attributes.id')
+        echo "NODE_ID=$NODE_ID" >> "$GITHUB_ENV"
+        curl -s "http://127.0.0.1/api/application/nodes/$NODE_ID/configuration" \
+          -H "$H_AUTH" -H "$H_ACC" > /tmp/wings-config.json
 
-      - name: Write Wings config and start Wings
-        run: |
-          set -e
-          jq '.api.port = 8080
-              | .api.host = "0.0.0.0"
-              | .remote = "http://127.0.0.1"
-              | .allowed_origins = ["*"]' \
-            /tmp/wings-config.json | sudo tee /etc/pterodactyl/config.yml > /dev/null
-          sudo mkdir -p /var/lib/pterodactyl/volumes
-          sudo chmod 600 /etc/pterodactyl/config.yml
-          sudo nohup /usr/local/bin/wings --config /etc/pterodactyl/config.yml \
-            > /tmp/wings.log 2>&1 &
-          disown || true
-          UP=0
-          for i in $(seq 1 30); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/api/system || true)
-            if [ "$CODE" = "200" ] || [ "$CODE" = "401" ]; then UP=1; break; fi
-            sleep 2
-          done
-          [ "$UP" = "1" ] || { echo "ERROR: Wings did not come up"; tail -n 40 /tmp/wings.log; exit 1; }
+    - name: Write Wings config and start Wings
+      run: |
+        set -e
+        jq '.api.port = 8080
+            | .api.host = "0.0.0.0"
+            | .remote = "http://127.0.0.1"
+            | .allowed_origins = ["*"]' \
+          /tmp/wings-config.json | sudo tee /etc/pterodactyl/config.yml > /dev/null
+        sudo mkdir -p /var/lib/pterodactyl/volumes
+        sudo chmod 600 /etc/pterodactyl/config.yml
+        sudo nohup /usr/local/bin/wings --config /etc/pterodactyl/config.yml \
+          > /tmp/wings.log 2>&1 &
+        disown || true
+        UP=0
+        for i in $(seq 1 30); do
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/api/system || true)
+          if [ "$CODE" = "200" ] || [ "$CODE" = "401" ]; then UP=1; break; fi
+          sleep 2
+        done
+        [ "$UP" = "1" ] || { echo "ERROR: Wings did not come up"; tail -n 40 /tmp/wings.log; exit 1; }
 
-      - name: Create Allocation and Server via API
-        run: |
-          set -e
-          H_AUTH="Authorization: Bearer $API_KEY"
-          H_ACC="Accept: application/json"
-          H_CT="Content-Type: application/json"
-          curl -s -X POST "http://127.0.0.1/api/application/nodes/$NODE_ID/allocations" \
-            -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
-            -d '{"ip":"0.0.0.0","ports":["25570"]}'
-          ALLOC_ID=$(curl -s "http://127.0.0.1/api/application/nodes/$NODE_ID/allocations" \
-            -H "$H_AUTH" -H "$H_ACC" | jq -r '.data[] | select(.attributes.port==25570) | .attributes.id' | head -1)
-          [ -n "$ALLOC_ID" ] || { echo "ERROR: no allocation"; exit 1; }
-          EGG_ID=$(curl -s "http://127.0.0.1/api/application/nests/1/eggs" \
-            -H "$H_AUTH" -H "$H_ACC" | jq -r '.data[] | select(.attributes.name=="Paper") | .attributes.id')
-          [ -n "$EGG_ID" ] && [ "$EGG_ID" != "null" ] || { echo "ERROR: Paper egg not found"; exit 1; }
-          SRV_JSON=$(curl -s -X POST "http://127.0.0.1/api/application/servers" \
-            -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
-            -d "{
-              \"name\":\"Paper 1.8.8\",
-              \"user\":1,
-              \"egg\":$EGG_ID,
-              \"docker_image\":\"ghcr.io/parkervcp/yolks:java_8\",
-              \"startup\":\"java -Xms128M -Xmx{{SERVER_MEMORY}}M -jar {{SERVER_JARFILE}}\",
-              \"environment\":{
-                \"SERVER_JARFILE\":\"server.jar\",
-                \"MINECRAFT_VERSION\":\"1.8.8\",
-                \"BUILD_NUMBER\":\"latest\",
-                \"DL_PATH\":\"\"
-              },
-              \"limits\":{\"memory\":2048,\"swap\":0,\"disk\":10240,\"io\":500,\"cpu\":200},
-              \"feature_limits\":{\"databases\":0,\"backups\":0,\"allocations\":1},
-              \"allocation\":{\"default\":$ALLOC_ID},
-              \"skip_scripts\":true,
-              \"start_on_completion\":false
-            }")
-          SRV_UUID=$(echo "$SRV_JSON" | jq -r '.attributes.uuid')
-          SRV_IDENT=$(echo "$SRV_JSON" | jq -r '.attributes.identifier')
-          [ "$SRV_UUID" = "null" ] || [ -z "$SRV_UUID" ] && { echo "ERROR: server creation failed"; exit 1; }
-          echo "SRV_UUID=$SRV_UUID" >> "$GITHUB_ENV"
-          echo "SRV_IDENT=$SRV_IDENT" >> "$GITHUB_ENV"
+    - name: Create Allocation and Server via API
+      run: |
+        set -e
+        H_AUTH="Authorization: Bearer $API_KEY"
+        H_ACC="Accept: application/json"
+        H_CT="Content-Type: application/json"
+        curl -s -X POST "http://127.0.0.1/api/application/nodes/$NODE_ID/allocations" \
+          -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
+          -d '{"ip":"0.0.0.0","ports":["25570"]}'
+        ALLOC_ID=$(curl -s "http://127.0.0.1/api/application/nodes/$NODE_ID/allocations" \
+          -H "$H_AUTH" -H "$H_ACC" | jq -r '.data[] | select(.attributes.port==25570) | .attributes.id' | head -1)
+        [ -n "$ALLOC_ID" ] || { echo "ERROR: no allocation"; exit 1; }
+        
+        EGG_ID=$(curl -s "http://127.0.0.1/api/application/nests/1/eggs" \
+          -H "$H_AUTH" -H "$H_ACC" | jq -r '.data[] | select(.attributes.name=="Paper") | .attributes.id')
+        [ -n "$EGG_ID" ] && [ "$EGG_ID" != "null" ] || { echo "ERROR: Paper egg not found"; exit 1; }
+        
+        SRV_JSON=$(curl -s -X POST "http://127.0.0.1/api/application/servers" \
+          -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
+          -d "{
+            \"name\":\"Paper 1.8.8\",
+            \"user\":1,
+            \"node\":$NODE_ID,
+            \"nest\":1,
+            \"egg\":$EGG_ID,
+            \"docker_image\":\"ghcr.io/parkervcp/yolks:java_8\",
+            \"startup\":\"java -Xms128M -Xmx{{SERVER_MEMORY}}M -jar {{SERVER_JARFILE}}\",
+            \"environment\":{
+              \"SERVER_JARFILE\":\"server.jar\",
+              \"MINECRAFT_VERSION\":\"1.8.8\",
+              \"BUILD_NUMBER\":\"latest\",
+              \"DL_PATH\":\"\"
+            },
+            \"limits\":{\"memory\":2048,\"swap\":0,\"disk\":10240,\"io\":500,\"cpu\":200},
+            \"feature_limits\":{\"databases\":0,\"backups\":0,\"allocations\":1},
+            \"allocation\":{\"default\":$ALLOC_ID},
+            \"skip_scripts\":true,
+            \"start_on_completion\":false
+          }")
+          
+        SRV_UUID=$(echo "$SRV_JSON" | jq -r '.attributes.uuid')
+        SRV_IDENT=$(echo "$SRV_JSON" | jq -r '.attributes.identifier')
+        
+        if [ "$SRV_UUID" = "null" ] || [ -z "$SRV_UUID" ]; then
+          echo "ERROR: server creation failed. API Response:"
+          echo "$SRV_JSON" | jq .
+          exit 1
+        fi
+        
+        echo "SRV_UUID=$SRV_UUID" >> "$GITHUB_ENV"
+        echo "SRV_IDENT=$SRV_IDENT" >> "$GITHUB_ENV"
 
-      - name: Install paper.jar into the server and start it
-        run: |
-          set -e
-          DIR="/var/lib/pterodactyl/volumes/$SRV_UUID"
-          for i in $(seq 1 60); do
-            [ -d "$DIR" ] && break
-            sleep 2
-          done
-          [ -d "$DIR" ] || { echo "ERROR: server directory not created"; tail -n 40 /tmp/wings.log; exit 1; }
-          sudo cp paper.jar "$DIR/server.jar"
-          echo "eula=true" | sudo tee "$DIR/eula.txt" > /dev/null
-          sudo chown --reference="$DIR" "$DIR/server.jar" "$DIR/eula.txt"
-          for i in $(seq 1 20); do
-            CODE=$(curl -s -o /tmp/power.json -w "%{http_code}" -X POST \
-              "http://127.0.0.1/api/client/servers/$SRV_IDENT/power" \
-              -H "Authorization: Bearer $CLIENT_KEY" -H "Accept: application/json" \
-              -H "Content-Type: application/json" -d '{"signal":"start"}')
-            [ "$CODE" = "204" ] && break
-            sleep 5
-          done
-          [ "$CODE" = "204" ] || { echo "ERROR: could not start server"; tail -n 40 /tmp/wings.log; exit 1; }
+    - name: Install paper.jar into the server and start it
+      run: |
+        set -e
+        DIR="/var/lib/pterodactyl/volumes/$SRV_UUID"
+        for i in $(seq 1 60); do
+          [ -d "$DIR" ] && break
+          sleep 2
+        done
+        [ -d "$DIR" ] || { echo "ERROR: server directory not created"; tail -n 40 /tmp/wings.log; exit 1; }
+        sudo cp paper.jar "$DIR/server.jar"
+        echo "eula=true" | sudo tee "$DIR/eula.txt" > /dev/null
+        sudo chown --reference="$DIR" "$DIR/server.jar" "$DIR/eula.txt"
+        for i in $(seq 1 20); do
+          CODE=$(curl -s -o /tmp/power.json -w "%{http_code}" -X POST \
+            "http://127.0.0.1/api/client/servers/$SRV_IDENT/power" \
+            -H "Authorization: Bearer $CLIENT_KEY" -H "Accept: application/json" \
+            -H "Content-Type: application/json" -d '{"signal":"start"}')
+          [ "$CODE" = "204" ] && break
+          sleep 5
+        done
+        [ "$CODE" = "204" ] || { echo "ERROR: could not start server"; tail -n 40 /tmp/wings.log; exit 1; }
 
-      # ============================================================
-      #  CUSTOM DASHBOARD
-      # ============================================================
-      - name: Create Custom Dashboard (PHP pages)
-        run: |
-          # Save runtime info for the daemon + dashboard
-          echo "$PORT1"        | sudo tee /tmp/dashboard_port1      > /dev/null
-          echo "$PORT2"        | sudo tee /tmp/dashboard_port2      > /dev/null
-          echo "$SRV_UUID"     | sudo tee /tmp/dashboard_srv_uuid   > /dev/null
-          echo "$SRV_IDENT"    | sudo tee /tmp/dashboard_srv_ident  > /dev/null
-          echo "$CLIENT_KEY"   | sudo tee /tmp/dashboard_client_key > /dev/null
-          echo "$PANEL_URL"    | sudo tee /tmp/dashboard_panel_url  > /dev/null
-          echo "$WINGS_URL"    | sudo tee /tmp/dashboard_wings_url  > /dev/null
-          echo "$STANDALONE_WORKDIR" | sudo tee /tmp/dashboard_workdir > /dev/null
-          echo "$JAVA_BIN"     | sudo tee /tmp/dashboard_java_bin   > /dev/null
-          sudo chmod 600 /tmp/dashboard_client_key
-          sudo chmod 644 /tmp/dashboard_port1 /tmp/dashboard_port2 /tmp/dashboard_srv_uuid \
-                        /tmp/dashboard_srv_ident /tmp/dashboard_panel_url /tmp/dashboard_wings_url \
-                        /tmp/dashboard_workdir /tmp/dashboard_java_bin
-
-          # -------- dashboard.php --------
-          sudo tee /var/www/pterodactyl/public/dashboard.php > /dev/null << 'PHP'
-          <?php
-          header('Cache-Control: no-store');
-          $info = @json_decode(@file_get_contents('/tmp/dashboard_info.json'), true);
-          if (!$info) $info = [];
-          $st = $info['standalone']  ?? ['address'=>'N/A','status'=>'unknown'];
-          $pt = $info['pterodactyl'] ?? ['address'=>'N/A','status'=>'unknown'];
-          $panel = $info['panel_url'] ?? '#';
-          $wings = $info['wings_url'] ?? '#';
-          $updated = $info['updated_at'] ?? 'N/A';
-          function badge($s){
-              $cls = $s === 'running' ? 'run' : ($s === 'stopped' ? 'stop' : 'unk');
-              return "<span class=\"badge $cls\">".htmlspecialchars($s)."</span>";
-          }
-          ?>
-          <!DOCTYPE html>
-          <html lang="en">
-          <head>
-          <meta charset="utf-8">
-          <meta http-equiv="refresh" content="10">
-          <title>Minecraft Dashboard</title>
-          <style>
-          *{box-sizing:border-box;margin:0;padding:0}
-          body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:#0d1117;color:#c9d1d9;min-height:100vh;padding:32px}
-          h1{font-size:24px;margin-bottom:6px;color:#58a6ff}
-          .sub{color:#8b949e;margin-bottom:24px;font-size:13px}
-          .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;max-width:1200px}
-          .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:20px}
-          .card h2{font-size:15px;margin-bottom:14px;color:#f0f6fc;font-weight:600}
-          .row{display:flex;justify-content:space-between;align-items:center;margin:10px 0;font-size:14px;gap:8px}
-          .addr{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#0d1117;padding:6px 10px;border-radius:6px;color:#79c0ff;font-size:13px}
-          .badge{padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600}
-          .run{background:#1a7f37;color:#fff}
-          .stop{background:#8b1a1a;color:#fff}
-          .unk{background:#6e7681;color:#fff}
-          .btns{display:flex;gap:8px;margin-top:18px}
-          form{display:inline}
-          button{padding:6px 14px;border:1px solid #30363d;background:#21262d;color:#c9d1d9;border-radius:6px;cursor:pointer;font-size:13px;transition:all .15s}
-          button:hover{background:#30363d;border-color:#8b949e}
-          button.go:hover{background:#1a7f37;border-color:#1a7f37;color:#fff}
-          button.no:hover{background:#8b1a1a;border-color:#8b1a1a;color:#fff}
-          a{color:#58a6ff;text-decoration:none}
-          a:hover{text-decoration:underline}
-          .foot{margin-top:24px;color:#6e7681;font-size:12px}
-          </style>
-          </head>
-          <body>
-          <h1>🎮 Minecraft Servers Dashboard</h1>
-          <div class="sub">Last update: <?= htmlspecialchars($updated) ?> UTC · auto-refresh every 10s</div>
-          <div class="grid">
-            <div class="card">
-              <h2>🟩 Standalone Paper 1.8.8</h2>
-              <div class="row"><span>Address</span><span class="addr"><?= htmlspecialchars($st['address']) ?></span></div>
-              <div class="row"><span>Status</span><?= badge($st['status']) ?></div>
-              <div class="btns">
-                <form method="post" action="/dashboard_action.php"><input type="hidden" name="target" value="standalone"><input type="hidden" name="action" value="start"><button class="go">▶ Start</button></form>
-                <form method="post" action="/dashboard_action.php"><input type="hidden" name="target" value="standalone"><input type="hidden" name="action" value="stop"><button class="no">⏹ Stop</button></form>
-              </div>
-            </div>
-            <div class="card">
-              <h2>🟩 Pterodactyl Server (Paper 1.8.8)</h2>
-              <div class="row"><span>Address</span><span class="addr"><?= htmlspecialchars($pt['address']) ?></span></div>
-              <div class="row"><span>Status</span><?= badge($pt['status']) ?></div>
-              <div class="btns">
-                <form method="post" action="/dashboard_action.php"><input type="hidden" name="target" value="pterodactyl"><input type="hidden" name="action" value="start"><button class="go">▶ Start</button></form>
-                <form method="post" action="/dashboard_action.php"><input type="hidden" name="target" value="pterodactyl"><input type="hidden" name="action" value="stop"><button class="no">⏹ Stop</button></form>
-              </div>
-            </div>
-            <div class="card">
-              <h2>⚙️ Panel &amp; Wings</h2>
-              <div class="row"><span>Panel</span><a href="<?= htmlspecialchars($panel) ?>" target="_blank"><?= htmlspecialchars($panel) ?></a></div>
-              <div class="row"><span>Wings</span><span class="addr"><?= htmlspecialchars($wings) ?></span></div>
-              <div class="row"><span>Email</span><span>admin@example.com</span></div>
-              <div class="row"><span>Password</span><span>AdminPassword123!</span></div>
+    # ============================================================
+    #  CUSTOM DASHBOARD
+    # ============================================================
+    - name: Create Custom Dashboard (PHP pages)
+      run: |
+        # Save runtime info for the daemon + dashboard
+        echo "$PORT1"        | sudo tee /tmp/dashboard_port1      > /dev/null
+        echo "$PORT2"        | sudo tee /tmp/dashboard_port2      > /dev/null
+        echo "$SRV_UUID"     | sudo tee /tmp/dashboard_srv_uuid   > /dev/null
+        echo "$SRV_IDENT"    | sudo tee /tmp/dashboard_srv_ident  > /dev/null
+        echo "$CLIENT_KEY"   | sudo tee /tmp/dashboard_client_key > /dev/null
+        echo "$PANEL_URL"    | sudo tee /tmp/dashboard_panel_url  > /dev/null
+        echo "$WINGS_URL"    | sudo tee /tmp/dashboard_wings_url  > /dev/null
+        echo "$STANDALONE_WORKDIR" | sudo tee /tmp/dashboard_workdir > /dev/null
+        echo "$JAVA_BIN"     | sudo tee /tmp/dashboard_java_bin   > /dev/null
+        sudo chmod 600 /tmp/dashboard_client_key
+        sudo chmod 644 /tmp/dashboard_port1 /tmp/dashboard_port2 /tmp/dashboard_srv_uuid \
+                      /tmp/dashboard_srv_ident /tmp/dashboard_panel_url /tmp/dashboard_wings_url \
+                      /tmp/dashboard_workdir /tmp/dashboard_java_bin
+        # -------- dashboard.php --------
+        sudo tee /var/www/pterodactyl/public/dashboard.php > /dev/null << 'PHP'
+        <?php
+        header('Cache-Control: no-store');
+        $info = @json_decode(@file_get_contents('/tmp/dashboard_info.json'), true);
+        if (!$info) $info = [];
+        $st = $info['standalone']  ?? ['address'=>'N/A','status'=>'unknown'];
+        $pt = $info['pterodactyl'] ?? ['address'=>'N/A','status'=>'unknown'];
+        $panel = $info['panel_url'] ?? '#';
+        $wings = $info['wings_url'] ?? '#';
+        $updated = $info['updated_at'] ?? 'N/A';
+        function badge($s){
+            $cls = $s === 'running' ? 'run' : ($s === 'stopped' ? 'stop' : 'unk');
+            return "<span class=\"badge $cls\">".htmlspecialchars($s)."</span>";
+        }
+        ?>
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+        <meta charset="utf-8">
+        <meta http-equiv="refresh" content="10">
+        <title>Minecraft Dashboard</title>
+        <style>
+        *{box-sizing:border-box;margin:0;padding:0}
+        body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:#0d1117;color:#c9d1d9;min-height:100vh;padding:32px}
+        h1{font-size:24px;margin-bottom:6px;color:#58a6ff}
+        .sub{color:#8b949e;margin-bottom:24px;font-size:13px}
+        .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;max-width:1200px}
+        .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:20px}
+        .card h2{font-size:15px;margin-bottom:14px;color:#f0f6fc;font-weight:600}
+        .row{display:flex;justify-content:space-between;align-items:center;margin:10px 0;font-size:14px;gap:8px}
+        .addr{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#0d1117;padding:6px 10px;border-radius:6px;color:#79c0ff;font-size:13px}
+        .badge{padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600}
+        .run{background:#1a7f37;color:#fff}
+        .stop{background:#8b1a1a;color:#fff}
+        .unk{background:#6e7681;color:#fff}
+        .btns{display:flex;gap:8px;margin-top:18px}
+        form{display:inline}
+        button{padding:6px 14px;border:1px solid #30363d;background:#21262d;color:#c9d1d9;border-radius:6px;cursor:pointer;font-size:13px;transition:all .15s}
+        button:hover{background:#30363d;border-color:#8b949e}
+        button.go:hover{background:#1a7f37;border-color:#1a7f37;color:#fff}
+        button.no:hover{background:#8b1a1a;border-color:#8b1a1a;color:#fff}
+        a{color:#58a6ff;text-decoration:none}
+        a:hover{text-decoration:underline}
+        .foot{margin-top:24px;color:#6e7681;font-size:12px}
+        </style>
+        </head>
+        <body>
+        <h1>🎮 Minecraft Servers Dashboard</h1>
+        <div class="sub">Last update: <?= htmlspecialchars($updated) ?> UTC · auto-refresh every 10s</div>
+        <div class="grid">
+          <div class="card">
+            <h2>🟩 Standalone Paper 1.8.8</h2>
+            <div class="row"><span>Address</span><span class="addr"><?= htmlspecialchars($st['address']) ?></span></div>
+            <div class="row"><span>Status</span><?= badge($st['status']) ?></div>
+            <div class="btns">
+              <form method="post" action="/dashboard_action.php"><input type="hidden" name="target" value="standalone"><input type="hidden" name="action" value="start"><button class="go">▶ Start</button></form>
+              <form method="post" action="/dashboard_action.php"><input type="hidden" name="target" value="standalone"><input type="hidden" name="action" value="stop"><button class="no">⏹ Stop</button></form>
             </div>
           </div>
-          <div class="foot">Pterodactyl + Paper 1.8.8 · bore.pub tunnels · GitHub Actions</div>
-          </body>
-          </html>
-          PHP
+          <div class="card">
+            <h2>🟩 Pterodactyl Server (Paper 1.8.8)</h2>
+            <div class="row"><span>Address</span><span class="addr"><?= htmlspecialchars($pt['address']) ?></span></div>
+            <div class="row"><span>Status</span><?= badge($pt['status']) ?></div>
+            <div class="btns">
+              <form method="post" action="/dashboard_action.php"><input type="hidden" name="target" value="pterodactyl"><input type="hidden" name="action" value="start"><button class="go">▶ Start</button></form>
+              <form method="post" action="/dashboard_action.php"><input type="hidden" name="target" value="pterodactyl"><input type="hidden" name="action" value="stop"><button class="no">⏹ Stop</button></form>
+            </div>
+          </div>
+          <div class="card">
+            <h2>⚙️ Panel &amp; Wings</h2>
+            <div class="row"><span>Panel</span><a href="<?= htmlspecialchars($panel) ?>" target="_blank"><?= htmlspecialchars($panel) ?></a></div>
+            <div class="row"><span>Wings</span><span class="addr"><?= htmlspecialchars($wings) ?></span></div>
+            <div class="row"><span>Email</span><span>admin@example.com</span></div>
+            <div class="row"><span>Password</span><span>AdminPassword123!</span></div>
+          </div>
+        </div>
+        <div class="foot">Pterodactyl + Paper 1.8.8 · bore.pub tunnels · GitHub Actions</div>
+        </body>
+        </html>
+        PHP
+        # -------- dashboard_action.php --------
+        sudo tee /var/www/pterodactyl/public/dashboard_action.php > /dev/null << 'PHP'
+        <?php
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') { http_response_code(405); exit; }
+        $target = $_POST['target'] ?? '';
+        $action = $_POST['action'] ?? '';
+        if (!in_array($target, ['standalone','pterodactyl'], true) ||
+            !in_array($action, ['start','stop'], true)) {
+            http_response_code(400); exit('bad request');
+        }
+        @mkdir('/tmp/dashboard_requests', 0777, true);
+        @chmod('/tmp/dashboard_requests', 0777);
+        $f = '/tmp/dashboard_requests/req_' . bin2hex(random_bytes(4)) . '.json';
+        file_put_contents($f, json_encode(['target'=>$target,'action'=>$action,'ts'=>time()]));
+        header('Location: /dashboard.php');
+        PHP
+        sudo chown www-data:www-data /var/www/pterodactyl/public/dashboard.php /var/www/pterodactyl/public/dashboard_action.php
 
-          # -------- dashboard_action.php --------
-          sudo tee /var/www/pterodactyl/public/dashboard_action.php > /dev/null << 'PHP'
-          <?php
-          if ($_SERVER['REQUEST_METHOD'] !== 'POST') { http_response_code(405); exit; }
-          $target = $_POST['target'] ?? '';
-          $action = $_POST['action'] ?? '';
-          if (!in_array($target, ['standalone','pterodactyl'], true) ||
-              !in_array($action, ['start','stop'], true)) {
-              http_response_code(400); exit('bad request');
-          }
-          @mkdir('/tmp/dashboard_requests', 0777, true);
-          @chmod('/tmp/dashboard_requests', 0777);
-          $f = '/tmp/dashboard_requests/req_' . bin2hex(random_bytes(4)) . '.json';
-          file_put_contents($f, json_encode(['target'=>$target,'action'=>$action,'ts'=>time()]));
-          header('Location: /dashboard.php');
-          PHP
+    - name: Start Dashboard Daemon (background)
+      run: |
+        sudo tee /usr/local/bin/dashboard_daemon.sh > /dev/null << 'SH'
+        #!/bin/bash
+        set -u
+        mkdir -p /tmp/dashboard_requests
+        chmod 777 /tmp/dashboard_requests
+        WORKDIR=$(cat /tmp/dashboard_workdir 2>/dev/null || echo "/tmp")
+        JAVA_BIN=$(cat /tmp/dashboard_java_bin 2>/dev/null || echo "java")
+        SRV_UUID=$(cat /tmp/dashboard_srv_uuid 2>/dev/null || echo "")
+        SRV_IDENT=$(cat /tmp/dashboard_srv_ident 2>/dev/null || echo "")
+        CLIENT_KEY=$(cat /tmp/dashboard_client_key 2>/dev/null || echo "")
+        while true; do
+            PORT1=$(cat /tmp/dashboard_port1 2>/dev/null || echo "")
+            PORT2=$(cat /tmp/dashboard_port2 2>/dev/null || echo "")
+            PANEL_URL=$(cat /tmp/dashboard_panel_url 2>/dev/null || echo "")
+            WINGS_URL=$(cat /tmp/dashboard_wings_url 2>/dev/null || echo "")
+            # ---- status checks ----
+            if pgrep -f "Xms512M.*paper.jar" > /dev/null 2>&1; then
+                ST_ST="running"
+            else
+                ST_ST="stopped"
+            fi
+            PT_ST="stopped"
+            if [ -n "$SRV_UUID" ]; then
+                if docker ps --format '{{.Names}}' 2>/dev/null | grep -qE "^${SRV_UUID:0:8}"; then
+                    PT_ST="running"
+                fi
+            fi
+            # ---- write status json ----
+            cat > /tmp/dashboard_info.json << JSON
+        {
+          "standalone": {"address": "bore.pub:${PORT1:-N/A}", "status": "$ST_ST"},
+          "pterodactyl": {"address": "bore.pub:${PORT2:-N/A}", "status": "$PT_ST"},
+          "panel_url": "https://${PANEL_URL}",
+          "wings_url": "https://${WINGS_URL}",
+          "updated_at": "$(date -u +%Y-%m-%d %H:%M:%S)"
+        }
+        JSON
+            chmod 644 /tmp/dashboard_info.json
+            # ---- process requests ----
+            shopt -s nullglob
+            for f in /tmp/dashboard_requests/*.json; do
+                ACTION=$(jq -r '.action // empty' "$f" 2>/dev/null)
+                TARGET=$(jq -r '.target // empty' "$f" 2>/dev/null)
+                rm -f "$f"
+                case "${TARGET}:${ACTION}" in
+                    standalone:start)
+                        ( cd "$WORKDIR" && nohup "$JAVA_BIN" -Xms512M -Xmx1G -jar paper.jar nogui > server.log 2>&1 & )
+                        ;;
+                    standalone:stop)
+                        pkill -f "Xms512M.*paper.jar" 2>/dev/null || true
+                        ;;
+                    pterodactyl:start)
+                        if [ -n "$SRV_IDENT" ] && [ -n "$CLIENT_KEY" ]; then
+                            curl -s -X POST "http://127.0.0.1/api/client/servers/$SRV_IDENT/power" \
+                                -H "Authorization: Bearer $CLIENT_KEY" \
+                                -H "Accept: application/json" \
+                                -H "Content-Type: application/json" \
+                                -d '{"signal":"start"}' > /dev/null || true
+                        fi
+                        ;;
+                    pterodactyl:stop)
+                        if [ -n "$SRV_IDENT" ] && [ -n "$CLIENT_KEY" ]; then
+                            curl -s -X POST "http://127.0.0.1/api/client/servers/$SRV_IDENT/power" \
+                                -H "Authorization: Bearer $CLIENT_KEY" \
+                                -H "Accept: application/json" \
+                                -H "Content-Type: application/json" \
+                                -d '{"signal":"stop"}' > /dev/null || true
+                        fi
+                        ;;
+                esac
+            done
+            shopt -u nullglob
+            sleep 3
+        done
+        SH
+        sudo chmod +x /usr/local/bin/dashboard_daemon.sh
+        sudo nohup /usr/local/bin/dashboard_daemon.sh > /tmp/dashboard_daemon.log 2>&1 &
+        disown || true
+        sleep 5
+        echo "----- dashboard_info.json -----"
+        cat /tmp/dashboard_info.json || true
+        echo "----- daemon log -----"
+        tail -n 20 /tmp/dashboard_daemon.log || true
 
-          sudo chown www-data:www-data /var/www/pterodactyl/public/dashboard.php /var/www/pterodactyl/public/dashboard_action.php
+    - name: Show panel + server info
+      run: |
+        PANEL_URL=$(cat /tmp/panel_url.txt)
+        echo "========================================================="
+        echo "PTERODACTYL PANEL:   https://$PANEL_URL"
+        echo "  Email:             admin@example.com"
+        echo "  Password:          AdminPassword123!"
+        echo ""
+        echo "CUSTOM DASHBOARD:    https://$PANEL_URL/dashboard.php"
+        echo ""
+        echo "Standalone Paper:    bore.pub:$PORT1"
+        echo "Pterodactyl Paper:   bore.pub:$PORT2"
+        echo "Wings URL:           https://$WINGS_URL"
+        echo "========================================================="
 
-      - name: Start Dashboard Daemon (background)
-        run: |
-          sudo tee /usr/local/bin/dashboard_daemon.sh > /dev/null << 'SH'
-          #!/bin/bash
-          set -u
-          mkdir -p /tmp/dashboard_requests
-          chmod 777 /tmp/dashboard_requests
-
-          WORKDIR=$(cat /tmp/dashboard_workdir 2>/dev/null || echo "/tmp")
-          JAVA_BIN=$(cat /tmp/dashboard_java_bin 2>/dev/null || echo "java")
-          SRV_UUID=$(cat /tmp/dashboard_srv_uuid 2>/dev/null || echo "")
-          SRV_IDENT=$(cat /tmp/dashboard_srv_ident 2>/dev/null || echo "")
-          CLIENT_KEY=$(cat /tmp/dashboard_client_key 2>/dev/null || echo "")
-
-          while true; do
-              PORT1=$(cat /tmp/dashboard_port1 2>/dev/null || echo "")
-              PORT2=$(cat /tmp/dashboard_port2 2>/dev/null || echo "")
-              PANEL_URL=$(cat /tmp/dashboard_panel_url 2>/dev/null || echo "")
-              WINGS_URL=$(cat /tmp/dashboard_wings_url 2>/dev/null || echo "")
-
-              # ---- status checks ----
-              if pgrep -f "Xms512M.*paper.jar" > /dev/null 2>&1; then
-                  ST_ST="running"
-              else
-                  ST_ST="stopped"
-              fi
-
-              PT_ST="stopped"
-              if [ -n "$SRV_UUID" ]; then
-                  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qE "^${SRV_UUID:0:8}"; then
-                      PT_ST="running"
-                  fi
-              fi
-
-              # ---- write status json ----
-              cat > /tmp/dashboard_info.json << JSON
-          {
-            "standalone": {"address": "bore.pub:${PORT1:-N/A}", "status": "$ST_ST"},
-            "pterodactyl": {"address": "bore.pub:${PORT2:-N/A}", "status": "$PT_ST"},
-            "panel_url": "https://${PANEL_URL}",
-            "wings_url": "https://${WINGS_URL}",
-            "updated_at": "$(date -u +%Y-%m-%d %H:%M:%S)"
-          }
-          JSON
-              chmod 644 /tmp/dashboard_info.json
-
-              # ---- process requests ----
-              shopt -s nullglob
-              for f in /tmp/dashboard_requests/*.json; do
-                  ACTION=$(jq -r '.action // empty' "$f" 2>/dev/null)
-                  TARGET=$(jq -r '.target // empty' "$f" 2>/dev/null)
-                  rm -f "$f"
-                  case "${TARGET}:${ACTION}" in
-                      standalone:start)
-                          ( cd "$WORKDIR" && nohup "$JAVA_BIN" -Xms512M -Xmx1G -jar paper.jar nogui > server.log 2>&1 & )
-                          ;;
-                      standalone:stop)
-                          pkill -f "Xms512M.*paper.jar" 2>/dev/null || true
-                          ;;
-                      pterodactyl:start)
-                          if [ -n "$SRV_IDENT" ] && [ -n "$CLIENT_KEY" ]; then
-                              curl -s -X POST "http://127.0.0.1/api/client/servers/$SRV_IDENT/power" \
-                                  -H "Authorization: Bearer $CLIENT_KEY" \
-                                  -H "Accept: application/json" \
-                                  -H "Content-Type: application/json" \
-                                  -d '{"signal":"start"}' > /dev/null || true
-                          fi
-                          ;;
-                      pterodactyl:stop)
-                          if [ -n "$SRV_IDENT" ] && [ -n "$CLIENT_KEY" ]; then
-                              curl -s -X POST "http://127.0.0.1/api/client/servers/$SRV_IDENT/power" \
-                                  -H "Authorization: Bearer $CLIENT_KEY" \
-                                  -H "Accept: application/json" \
-                                  -H "Content-Type: application/json" \
-                                  -d '{"signal":"stop"}' > /dev/null || true
-                          fi
-                          ;;
-                  esac
-              done
-              shopt -u nullglob
-
-              sleep 3
-          done
-          SH
-          sudo chmod +x /usr/local/bin/dashboard_daemon.sh
-          sudo nohup /usr/local/bin/dashboard_daemon.sh > /tmp/dashboard_daemon.log 2>&1 &
-          disown || true
-          sleep 5
-          echo "----- dashboard_info.json -----"
-          cat /tmp/dashboard_info.json || true
-          echo "----- daemon log -----"
-          tail -n 20 /tmp/dashboard_daemon.log || true
-
-      - name: Show panel + server info
-        run: |
-          PANEL_URL=$(cat /tmp/panel_url.txt)
-          echo "========================================================="
-          echo "PTERODACTYL PANEL:   https://$PANEL_URL"
-          echo "  Email:             admin@example.com"
-          echo "  Password:          AdminPassword123!"
-          echo ""
-          echo "CUSTOM DASHBOARD:    https://$PANEL_URL/dashboard.php"
-          echo ""
-          echo "Standalone Paper:    bore.pub:$PORT1"
-          echo "Pterodactyl Paper:   bore.pub:$PORT2"
-          echo "Wings URL:           https://$WINGS_URL"
-          echo "========================================================="
-
-      - name: Keep job alive (tail Wings log)
-        run: tail -f /tmp/wings.log
+    - name: Keep job alive (tail Wings log)
+      run: tail -f /tmp/wings.log
