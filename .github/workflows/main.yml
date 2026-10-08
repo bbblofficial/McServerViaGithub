@@ -91,41 +91,74 @@ jobs:
           echo "PANEL URL: https://$PANEL_URL"
 
       # ============================================================
-      # NEW STEPS — Wings + Node + Server
+      # Wings + Node + Server
       # ============================================================
 
       - name: Install Docker and Wings
         run: |
-          # Docker (already present on GH runners; the installer is idempotent)
           curl -fsSL https://get.docker.com | sudo sh
           sudo systemctl start docker
           sudo systemctl enable docker
 
-          # Wings binary. 0755 so both root AND the runner user can execute it.
           sudo mkdir -p /etc/pterodactyl
           sudo curl -L -o /usr/local/bin/wings \
             "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_amd64"
           sudo chmod 0755 /usr/local/bin/wings
-          sudo /usr/local/bin/wings --version || true
+          # Correct invocation is a subcommand, not a flag
+          sudo /usr/local/bin/wings version || true
 
-      - name: Create Application API Key (direct DB insert)
+      # ------------------------------------------------------------
+      # Create the application API key via the Eloquent model so that
+      # Laravel encrypts the token with the panel's APP_KEY (required
+      # by Pterodactyl 1.11+ where ApiKey::$casts['token']='encrypted').
+      # ------------------------------------------------------------
+      - name: Create Application API Key via Eloquent
         id: apikey
         run: |
           set -e
-          # identifier: 16 hex chars. token: 32 hex chars. token stored as sha256 hash.
-          ID=$(openssl rand -hex 8)
-          TOKEN=$(openssl rand -hex 16)
-          HASHED=$(printf '%s' "$TOKEN" | sha256sum | awk '{print $1}')
+          sudo tee /tmp/mk-apikey.php > /dev/null << 'PHP'
+          <?php
+          require '/var/www/pterodactyl/vendor/autoload.php';
+          $app = require '/var/www/pterodactyl/bootstrap/app.php';
+          $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
 
-          # key_type = 1  =>  TYPE_APPLICATION
-          # user_id  = 1  =>  the admin user created by the installer (root_admin = 1)
-          sudo mysql panel -e "DELETE FROM api_keys WHERE memo='automation';"
-          sudo mysql panel -e "INSERT INTO api_keys \
-            (user_id, key_type, identifier, token, memo, allowed_ips, created_at, updated_at) \
-            VALUES (1, 1, '$ID', '$HASHED', 'automation', '[]', NOW(), NOW());"
+          use App\Models\ApiKey;
 
-          echo "API_KEY=$ID.$TOKEN" >> "$GITHUB_ENV"
-          echo "Generated API key: ${ID:0:8}... (hash stored in DB)"
+          // Clean up any previous automation key
+          ApiKey::where('memo', 'automation')->delete();
+
+          // 32-hex plaintext token, 16-hex identifier. The model will
+          // encrypt `token` on save (1.11+) or hash it (<=1.10) as appropriate.
+          $plain = bin2hex(random_bytes(16));
+
+          $key = ApiKey::create([
+              'user_id'     => 1,
+              'key_type'    => ApiKey::TYPE_APPLICATION,  // = 2
+              'identifier'  => bin2hex(random_bytes(8)),
+              'token'       => $plain,
+              'memo'        => 'automation',
+              'allowed_ips' => [],
+          ]);
+
+          // Sanity log to help debug if auth ever breaks
+          fwrite(STDERR, sprintf(
+              "Created ApiKey id=%d type=%d identifier=%s raw_token_in_db=%s\n",
+              $key->id,
+              $key->key_type,
+              $key->identifier,
+              substr((string) $key->getRawOriginal('token'), 0, 20) . '...'
+          ));
+
+          echo $key->identifier . '.' . $plain . "\n";
+          PHP
+
+          API_KEY=$(sudo -u www-data php /tmp/mk-apikey.php)
+          if [ -z "$API_KEY" ] || [ "${API_KEY#*.}" = "$API_KEY" ]; then
+            echo "ERROR: could not generate API key (got '$API_KEY')"
+            exit 1
+          fi
+          echo "API_KEY=$API_KEY" >> "$GITHUB_ENV"
+          echo "Generated API key: ${API_KEY:0:20}..."
 
       - name: Create Location and Node
         run: |
@@ -173,7 +206,6 @@ jobs:
           head -c 400 /tmp/wings-config.json; echo
           echo "-------------------------------"
 
-          # Sanity check: the config must contain a non-empty token
           if ! jq -e '.token and (.token | length > 0)' /tmp/wings-config.json > /dev/null; then
             echo "ERROR: wings config has no token"; exit 1
           fi
@@ -181,7 +213,6 @@ jobs:
       - name: Write Wings config and start Wings
         run: |
           set -e
-          # Rewrite "remote" to localhost so Wings talks straight to nginx.
           jq '.remote = "http://127.0.0.1"' /tmp/wings-config.json \
             | sudo tee /etc/pterodactyl/config.yml > /dev/null
 
@@ -189,7 +220,6 @@ jobs:
           sudo chown -R root:root /etc/pterodactyl
           sudo chmod 600 /etc/pterodactyl/config.yml
 
-          # Detach Wings from the shell so it survives the step
           sudo nohup /usr/local/bin/wings --config /etc/pterodactyl/config.yml \
             > /tmp/wings.log 2>&1 &
           disown || true
@@ -198,7 +228,6 @@ jobs:
           tail -n 40 /tmp/wings.log || true
           echo "---------------------"
 
-          # Wait for Wings HTTP API
           for i in $(seq 1 20); do
             if curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/api/system | grep -q 200; then
               echo "Wings is up."; break
@@ -213,8 +242,6 @@ jobs:
           H_ACC="Accept: application/json"
           H_CT="Content-Type: application/json"
 
-          # Create an allocation on the node (25570 so we don't clash with
-          # the standalone Paper server on 25565)
           ALLOC_RESP=$(curl -s -X POST "http://127.0.0.1/api/application/nodes/$NODE_ID/allocations" \
             -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
             -d '{"ip":"0.0.0.0","ports":["25570"]}')
@@ -223,13 +250,11 @@ jobs:
             -H "$H_AUTH" -H "$H_ACC" | jq -r '.data[0].attributes.id')
           echo "Allocation ID: $ALLOC_ID"
 
-          # Find the Paper egg id
           EGG_ID=$(curl -s "http://127.0.0.1/api/application/nests/1/eggs" \
             -H "$H_AUTH" -H "$H_ACC" | jq -r '.data[] | select(.attributes.name=="Paper") | .attributes.id')
           echo "Paper egg id: $EGG_ID"
           [ -z "$EGG_ID" ] || [ "$EGG_ID" = "null" ] && EGG_ID=1
 
-          # Create the server
           SRV_JSON=$(curl -s -X POST "http://127.0.0.1/api/application/servers" \
             -H "$H_AUTH" -H "$H_ACC" -H "$H_CT" \
             -d "{
