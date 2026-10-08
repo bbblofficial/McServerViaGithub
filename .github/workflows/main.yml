@@ -18,7 +18,7 @@ jobs:
       - name: Download Paper 1.8.8 Build 445
         run: |
           wget -O paper.jar https://fill-data.papermc.io/v1/objects/7ff6d2cec671ef0d95b3723b5c92890118fb882d73b7f8fa0a2cd31d97c55f86/paper-1.8.8-445.jar
-          
+
       - name: Accept Minecraft EULA
         run: echo "eula=true" > eula.txt
 
@@ -69,31 +69,28 @@ jobs:
         run: |
           sudo apt-get install -y expect
           cat << 'EOF' > install_panel.exp
-          set timeout -1
-          
-          # We download the file first to bypass the process-substitution /dev/fd/ restriction
+          set timeout 1800
           spawn sudo bash -c "curl -s https://raw.githubusercontent.com/pterodactyl-installer/pterodactyl-installer/master/install.sh > install.sh && bash install.sh"
-
-          # Infinite expect loop to handle optional/variable prompts smoothly
-          while {1} {
-              expect {
-                  "What would you like to do?" { send "0\r" }
-                  "Database name (panel):" { send "\r" }
-                  "Database username (pterodactyl):" { send "\r" }
-                  "Password (press enter to use randomly generated password):" { send "\r" }
-                  "Select timezone" { send "UTC\r" }
-                  "Provide the email address that will be used to configure Let's Encrypt and Pterodactyl:" { send "admin@example.com\r" }
-                  "Email address for the initial admin account:" { send "admin@example.com\r" }
-                  "Username for the initial admin account:" { send "admin\r" }
-                  "First name for the initial admin account:" { send "Admin\r" }
-                  "Last name for the initial admin account:" { send "User\r" }
-                  "Password for the initial admin account:" { send "AdminPassword123!\r" }
-                  "Set the FQDN of this panel" { send "127.0.0.1\r" }
-                  "Do you want to automatically configure UFW?" { send "N\r" }
-                  "Do you want to automatically configure HTTPS using Let's Encrypt?" { send "N\r" }
-                  "Continue with installation?" { send "y\r" }
-                  eof { break }
-              }
+          expect {
+              timeout { puts "ERROR: expect timed out waiting for Pterodactyl installer prompt"; exit 1 }
+              -re {Input 0-6:}                                                   { send "0\r"; exp_continue }
+              -re {Database name \(panel\):}                                     { send "\r"; exp_continue }
+              -re {Database username \(pterodactyl\):}                           { send "\r"; exp_continue }
+              -re {Password \(press enter to use randomly generated password\):} { send "\r"; exp_continue }
+              -re {Select timezone \[.*\]:}                                      { send "UTC\r"; exp_continue }
+              -re {email address that will be used to configure}                 { send "admin@example.com\r"; exp_continue }
+              -re {Email address for the initial admin account:}                 { send "admin@example.com\r"; exp_continue }
+              -re {Username for the initial admin account:}                      { send "admin\r"; exp_continue }
+              -re {First name for the initial admin account:}                    { send "Admin\r"; exp_continue }
+              -re {Last name for the initial admin account:}                     { send "User\r"; exp_continue }
+              -re {Password for the initial admin account:}                      { send "AdminPassword123!\r"; exp_continue }
+              -re {Set the FQDN of this panel}                                   { send "127.0.0.1\r"; exp_continue }
+              -re {configure UFW.*\(y/N\)}                                       { send "N\r"; exp_continue }
+              -re {configure HTTPS using Let's Encrypt.*\(y/N\)}                 { send "N\r"; exp_continue }
+              -re {[Tt]elemetry[^:]*\(y/N\)}                                     { send "N\r"; exp_continue }
+              -re {[Tt]elemetry.*\?.*}                                           { send "N\r"; exp_continue }
+              -re {Continue with installation.*\(y/N\)}                          { send "y\r"; exp_continue }
+              eof
           }
           EOF
           expect install_panel.exp
@@ -112,12 +109,11 @@ jobs:
             echo "ERROR: Could not extract cloudflared URL."
             exit 1
           fi
-          
+
           # Inject the new Cloudflare Tunnel URL into Laravel's APP_URL configuration
-          # This ensures the browser doesn't try to load Panel CSS and Javascript assets from '127.0.0.1' 
           sudo sed -i "s|APP_URL=http://127.0.0.1|APP_URL=https://$PANEL_URL|g" /var/www/pterodactyl/.env
           cd /var/www/pterodactyl && sudo -u www-data php artisan optimize:clear
-          
+
           echo "========================================================="
           echo "PTERODACTYL PANEL URL: https://$PANEL_URL"
           echo "ADMIN EMAIL: admin@example.com"
