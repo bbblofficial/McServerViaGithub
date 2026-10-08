@@ -1,4 +1,4 @@
-name: Paper 1.8.8 Server via FRP
+name: Paper 1.8.8 (bore.pub fully auto)
 
 on:
   workflow_dispatch:
@@ -22,38 +22,34 @@ jobs:
       - name: Accept Minecraft EULA
         run: echo "eula=true" > eula.txt
 
-      - name: Download and Configure FRP Client
-        env:
-          VPS_IP: ${{ vars.VPS_IP }}
-          FRP_TOKEN: ${{ secrets.FRP_TOKEN }}
+      - name: Install bore and create TCP tunnel
         run: |
-          wget -q https://github.com/fatedier/frp/releases/download/v0.58.1/frp_0.58.1_linux_amd64.tar.gz
-          tar -xzf frp_0.58.1_linux_amd64.tar.gz
-          mv frp_0.58.1_linux_amd64/frpc .
-          chmod +x frpc
+          # Download bore (Rust binary, no deps)
+          wget -q https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
+          tar xzf bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
+          chmod +x bore
 
-          cat > frpc.toml <<EOF
-          serverAddr = "${VPS_IP}"
-          serverPort = 7000
-          auth.method = "token"
-          auth.token = "${FRP_TOKEN}"
+          # Start tunnel to localhost:25565, capture output
+          ./bore local 25565 --to bore.pub > bore.log 2>&1 &
+          sleep 8
 
-          [[proxies]]
-          name = "minecraft-server"
-          type = "tcp"
-          localIP = "127.0.0.1"
-          localPort = 25565
-          remotePort = 25565
-          EOF
+          echo "----- bore output -----"
+          cat bore.log
+          echo "-----------------------"
 
-          ./frpc -c frpc.toml > frp.log 2>&1 &
-          sleep 5
-
-          echo "FRP log:"
-          cat frp.log || true
+          # Extract the public port
+          PUBLIC_PORT=$(grep -oP 'remote_port=\K[0-9]+' bore.log | head -1)
+          if [ -z "$PUBLIC_PORT" ]; then
+            echo "ERROR: Could not extract bore public port."
+            exit 1
+          fi
 
           echo "========================================================="
-          echo "Players can join using: ${VPS_IP}:25565"
+          echo "SERVER ADDRESS: bore.pub:$PUBLIC_PORT"
+          echo "========================================================="
+          echo "Players connect to:"
+          echo "  Host: bore.pub"
+          echo "  Port: $PUBLIC_PORT"
           echo "========================================================="
 
       - name: Start Paper Server
