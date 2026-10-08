@@ -1,4 +1,4 @@
-name: Paper 1.8.8 + optional Pterodactyl (selectable tunnel)
+name: Paper 1.8.8 + EssentialsX + optional Pterodactyl (multi tunnel)
 
 on:
   workflow_dispatch:
@@ -11,6 +11,10 @@ on:
         description: "online-mode (true = premium only, false = cracked allowed)"
         type: boolean
         default: true
+      install_essentials:
+        description: "Automatically install EssentialsX"
+        type: boolean
+        default: true
       ram_mb:
         description: "RAM for Minecraft server in MB"
         type: string
@@ -20,10 +24,14 @@ on:
         type: string
         default: "muvixo"
       tunnel:
-        description: "auto = bore > pinggy | bore = bore.pub (open source) | pinggy = free SSH service | playit = open-source agent, you claim it with a free account (not in auto). Panel needs bore or auto."
+        description: "auto = bore > pinggy > serveo > frp > playit (retried 3x) | or force one. Panel needs bore or auto. frp/playit need repo secrets (see comments)."
         type: choice
-        options: [auto, bore, pinggy, playit]
+        options: [auto, bore, pinggy, serveo, frp, playit]
         default: auto
+      bore_server:
+        description: "bore server (bore.pub is the public one; you can self-host your own `bore server`)"
+        type: string
+        default: "bore.pub"
       mc_port:
         description: "Preferred public port (bore only; others pick their own and print it in the log)"
         type: string
@@ -47,6 +55,15 @@ env:
   REQ_WINGS_PORT: ${{ inputs.wings_port }}
   REQ_RAM_MB: ${{ inputs.ram_mb }}
   OP_PLAYER: ${{ inputs.op_player }}
+  BORE_HOST: ${{ inputs.bore_server }}
+  # Optional repository secrets (Settings > Secrets and variables > Actions):
+  #   FRP_SERVER, FRP_TOKEN, FRP_SERVER_PORT (default 7000), FRP_REMOTE_PORT (default 25565)  -> your own frps server
+  #   PLAYIT_SECRET                                                                           -> playit.gg agent secret
+  FRP_SERVER: ${{ secrets.FRP_SERVER }}
+  FRP_TOKEN: ${{ secrets.FRP_TOKEN }}
+  FRP_SERVER_PORT: ${{ secrets.FRP_SERVER_PORT }}
+  FRP_REMOTE_PORT: ${{ secrets.FRP_REMOTE_PORT }}
+  PLAYIT_SECRET: ${{ secrets.PLAYIT_SECRET }}
 
 jobs:
   run-server:
@@ -55,7 +72,7 @@ jobs:
 
     steps:
     # ------------------------------------------------------------
-    # 0. prepare: random panel password, open firewall, sanity checks
+    # 0. prepare
     # ------------------------------------------------------------
     - name: Prepare
       run: |
@@ -68,14 +85,16 @@ jobs:
         if ! [[ "$OP_PLAYER" =~ ^[A-Za-z0-9_]{0,16}$ ]]; then
           echo "::error::op_player must be a valid Minecraft name (letters, digits, underscore, max 16)."; exit 1
         fi
+        if ! [[ "$BORE_HOST" =~ ^[A-Za-z0-9.-]+$ ]]; then
+          echo "::error::bore_server must be a plain hostname."; exit 1
+        fi
 
         # keep RAM inside what a hosted runner can really give
         RAM="$REQ_RAM_MB"
+        [[ "$RAM" =~ ^[0-9]+$ ]] || { echo "RAM value invalid, using 2048"; RAM=2048; }
         if [ "${{ inputs.with_panel }}" = "true" ]; then MAXR=6000; else MAXR=12000; fi
-        if [ "$RAM" -gt "$MAXR" ] 2>/dev/null; then
-          echo "RAM $RAM MB is too high for this mode, using $MAXR MB"
-          RAM="$MAXR"
-        fi
+        [ "$RAM" -gt "$MAXR" ] && { echo "RAM $RAM MB too high for this mode, using $MAXR MB"; RAM="$MAXR"; }
+        [ "$RAM" -lt 512 ] && RAM=512
         echo "MC_RAM=$RAM" >> "$GITHUB_ENV"
 
         sudo ufw disable 2>/dev/null || true
@@ -86,20 +105,19 @@ jobs:
         echo "Firewall opened."
 
     # ------------------------------------------------------------
-    # 1. public TCP tunnel (bore / pinggy / playit / auto)
+    # 1. public TCP tunnel (bore / pinggy / serveo / frp / playit / auto)
     # ------------------------------------------------------------
     - name: Start tunnel
       run: |
         set -e
         MODE="${{ inputs.tunnel }}"
         PANEL="${{ inputs.with_panel }}"
-        BORE_HOST="bore.pub"
         ADDR=""
 
         mkdir -p ~/.ssh
         [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519 -q
 
-        # ---------- helper scripts ----------
+        # ---------- supervisor scripts (auto-reconnect) ----------
         cat > bore_sup.sh << 'EOF'
         #!/bin/bash
         # usage: bore_sup.sh LOCAL_PORT REMOTE_PORT BORE_BIN HOST
@@ -123,7 +141,33 @@ jobs:
           sleep 20
         done
         EOF
-        chmod +x bore_sup.sh pinggy_sup.sh
+
+        cat > serveo_sup.sh << 'EOF'
+        #!/bin/bash
+        while true; do
+          tail -f /dev/null | ssh -T \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+            -o ExitOnForwardFailure=yes -o ConnectTimeout=15 \
+            -R 0:localhost:25565 serveo.net >> /tmp/serveo.log 2>&1
+          echo "$(date -u) serveo exited, restarting in 10s" >> /tmp/serveo.log
+          sleep 10
+        done
+        EOF
+
+        cat > generic_sup.sh << 'EOF'
+        #!/bin/bash
+        # usage: generic_sup.sh LOGFILE CMD...
+        LOG="$1"; shift
+        while true; do
+          "$@" >> "$LOG" 2>&1
+          echo "$(date -u) $1 exited, restarting in 5s" >> "$LOG"
+          sleep 5
+        done
+        EOF
+        chmod +x bore_sup.sh pinggy_sup.sh serveo_sup.sh generic_sup.sh
+
+        strip() { sed 's/\x1b\[[0-9;]*m//g' "$1"; }
 
         # open_port NAME LOCAL|same PREFERRED_PORT -> prints the port actually obtained
         open_port() {
@@ -133,7 +177,7 @@ jobs:
             : > "/tmp/bore_$port.log"
             nohup ./bore_sup.sh "$L" "$port" "$PWD/bore" "$BORE_HOST" > /dev/null 2>&1 &
             for i in $(seq 1 10); do
-              if sed 's/\x1b\[[0-9;]*m//g' "/tmp/bore_$port.log" | grep -q "$BORE_HOST:$port"; then
+              if strip "/tmp/bore_$port.log" | grep -q "$BORE_HOST:$port"; then
                 echo "$name -> $BORE_HOST:$port" >&2
                 echo "$port"; return 0
               fi
@@ -150,11 +194,15 @@ jobs:
 
         # ---------- bore ----------
         try_bore() {
-          local VER MC PP WP
+          local VER MC PP WP ok=""
           if [ ! -x ./bore ]; then
             VER=$(curl -fsSL https://api.github.com/repos/ekzhang/bore/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+' || true)
-            [ -n "$VER" ] || VER="v0.6.0"
-            curl -fsSL "https://github.com/ekzhang/bore/releases/download/${VER}/bore-${VER}-x86_64-unknown-linux-musl.tar.gz" | tar xz || return 1
+            for v in $VER v0.6.0 v0.5.2 v0.5.1; do
+              if curl -fsSL "https://github.com/ekzhang/bore/releases/download/${v}/bore-${v}-x86_64-unknown-linux-musl.tar.gz" | tar xz 2>/dev/null; then
+                ok=1; break
+              fi
+            done
+            [ -n "$ok" ] && [ -f bore ] || { echo "bore: download failed"; return 1; }
             chmod +x bore
           fi
           MC=$(open_port minecraft 25565 "$REQ_MC_PORT") || { echo "bore: no free port on $BORE_HOST (down?)"; tail -n 20 /tmp/bore_*.log 2>/dev/null || true; return 1; }
@@ -162,8 +210,8 @@ jobs:
           echo "MC_PORT=$MC" >> "$GITHUB_ENV"
           ADDR="$BORE_HOST:$MC"
           if [ "$PANEL" = "true" ]; then
-            PP=$(open_port panel 80 "$REQ_PANEL_PORT") || { echo "::error::no panel port"; exit 1; }
-            WP=$(open_port wings same "$REQ_WINGS_PORT") || { echo "::error::no wings port"; exit 1; }
+            PP=$(open_port panel 80 "$REQ_PANEL_PORT") || { echo "bore: no panel port"; return 1; }
+            WP=$(open_port wings same "$REQ_WINGS_PORT") || { echo "bore: no wings port"; return 1; }
             echo "PANEL_PORT=$PP" >> "$GITHUB_ENV"
             echo "WINGS_PORT=$WP" >> "$GITHUB_ENV"
           fi
@@ -176,7 +224,7 @@ jobs:
           : > /tmp/pinggy.log
           nohup ./pinggy_sup.sh > /dev/null 2>&1 &
           for i in $(seq 1 30); do
-            ADDR=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/pinggy.log | grep -oE 'tcp://[A-Za-z0-9.-]+:[0-9]{2,5}' | head -1 | sed 's#tcp://##' || true)
+            ADDR=$(strip /tmp/pinggy.log | grep -oE 'tcp://[A-Za-z0-9.-]+:[0-9]{2,5}' | head -1 | sed 's#tcp://##' || true)
             [ -n "$ADDR" ] && return 0
             grep -qE 'timed out|refused|Permission denied|forwarding failed' /tmp/pinggy.log && break
             sleep 1
@@ -187,49 +235,114 @@ jobs:
           return 1
         }
 
-        # ---------- playit (open-source agent; you claim it once with a free account) ----------
-        try_playit() {
-          local i LINK SHOWN=""
-          curl -fsSL -o playit https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-linux-amd64 || { echo "playit: download failed"; return 1; }
-          chmod +x playit
-          : > /tmp/playit.log
-          nohup ./playit --stdout > /tmp/playit.log 2>&1 &
-          echo "=== PLAYIT: open the claim link printed below, log in, then create a 'Minecraft Java' tunnel to 127.0.0.1:25565 ==="
-          for i in $(seq 1 120); do
-            LINK=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/playit.log | grep -oE 'https://playit\.gg/[^ ]+' | head -1 || true)
-            if [ -n "$LINK" ] && [ "$LINK" != "$SHOWN" ]; then echo "PLAYIT CLAIM LINK: $LINK"; SHOWN="$LINK"; fi
-            ADDR=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/playit.log | grep -oE '[A-Za-z0-9.-]+\.(joinmc\.link|ply\.gg)(:[0-9]+)?' | head -1 || true)
+        # ---------- serveo (ssh -R, open source server) ----------
+        try_serveo() {
+          local i
+          : > /tmp/serveo.log
+          nohup ./serveo_sup.sh > /dev/null 2>&1 &
+          for i in $(seq 1 30); do
+            ADDR=$(strip /tmp/serveo.log | grep -oE 'serveo\.net:[0-9]{2,5}' | head -1 || true)
             [ -n "$ADDR" ] && return 0
-            [ -n "$LINK" ] && { ADDR="(see your playit.gg dashboard > Tunnels for the address)"; return 0; }
+            grep -qE 'timed out|refused|Permission denied|forwarding failed' /tmp/serveo.log && break
             sleep 1
           done
-          echo "playit: no claim link or address. Log:"; cat /tmp/playit.log || true
-          pkill -f "playit --stdout" 2>/dev/null || true
+          echo "serveo: no address. Log:"; cat /tmp/serveo.log || true
+          pkill -f serveo_sup.sh 2>/dev/null || true
+          pkill -f "serveo.net" 2>/dev/null || true
           return 1
         }
 
-        # ---------- run selected mode ----------
-        OK=""
-        if [ "$PANEL" = "true" ]; then
-          try_bore && OK=1
-        else
-          case "$MODE" in
-            bore)   try_bore   && OK=1 ;;
-            pinggy) try_pinggy && OK=1 ;;
-            playit) try_playit && OK=1 ;;
-            auto)
-              try_bore   && OK=1 || true
-              [ -n "$OK" ] || { echo ">> bore failed, trying pinggy"; try_pinggy && OK=1 || true; }
-              ;;
-          esac
-        fi
+        # ---------- frp (needs your own frps server + secrets) ----------
+        try_frp() {
+          local i V=0.61.1 RP="${FRP_REMOTE_PORT:-25565}" SP="${FRP_SERVER_PORT:-7000}"
+          if [ -z "$FRP_SERVER" ] || [ -z "$FRP_TOKEN" ]; then
+            echo "frp: secrets FRP_SERVER / FRP_TOKEN not set, skipping"; return 1
+          fi
+          if [ ! -x ./frpc ]; then
+            curl -fsSL "https://github.com/fatedier/frp/releases/download/v${V}/frp_${V}_linux_amd64.tar.gz" | tar xz || return 1
+            cp "frp_${V}_linux_amd64/frpc" ./frpc && chmod +x frpc
+          fi
+          echo "::add-mask::$FRP_TOKEN"
+          {
+            echo "serverAddr = \"$FRP_SERVER\""
+            echo "serverPort = $SP"
+            echo "auth.token = \"$FRP_TOKEN\""
+            echo "[[proxies]]"
+            echo "name = \"minecraft\""
+            echo "type = \"tcp\""
+            echo "localIP = \"127.0.0.1\""
+            echo "localPort = 25565"
+            echo "remotePort = $RP"
+          } > frpc.toml
+          : > /tmp/frp.log
+          nohup ./generic_sup.sh /tmp/frp.log ./frpc -c frpc.toml > /dev/null 2>&1 &
+          for i in $(seq 1 30); do
+            if grep -q "start proxy success" /tmp/frp.log; then ADDR="$FRP_SERVER:$RP"; return 0; fi
+            sleep 1
+          done
+          echo "frp: failed. Log:"; cat /tmp/frp.log || true
+          pkill -f generic_sup.sh 2>/dev/null || true
+          pkill -f frpc 2>/dev/null || true
+          return 1
+        }
 
-        [ -n "$OK" ] || { echo "::error::no tunnel could be opened (all selected services failed or are down)"; exit 1; }
+        # ---------- playit.gg (open source agent, needs PLAYIT_SECRET + a tunnel set to 25565 in the dashboard) ----------
+        try_playit() {
+          local i
+          if [ -z "$PLAYIT_SECRET" ]; then echo "playit: secret PLAYIT_SECRET not set, skipping"; return 1; fi
+          echo "::add-mask::$PLAYIT_SECRET"
+          if [ ! -x ./playit ]; then
+            curl -fsSL -o playit "https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-linux-amd64" || return 1
+            chmod +x playit
+          fi
+          : > /tmp/playit.log
+          nohup ./generic_sup.sh /tmp/playit.log ./playit -s --secret "$PLAYIT_SECRET" > /dev/null 2>&1 &
+          for i in $(seq 1 40); do
+            ADDR=$(strip /tmp/playit.log | grep -oE '[A-Za-z0-9.-]+\.(joinmc\.link|gl\.joinmc\.link|ply\.gg)(:[0-9]{2,5})?' | head -1 || true)
+            [ -n "$ADDR" ] && return 0
+            sleep 1
+          done
+          if pgrep -f "playit -s" > /dev/null; then
+            ADDR="(agent running - copy the address from your playit.gg dashboard)"
+            return 0
+          fi
+          echo "playit: failed. Log:"; cat /tmp/playit.log || true
+          return 1
+        }
+
+        # ---------- one pass over the selected tunnel(s) ----------
+        run_once() {
+          case "$MODE" in
+            bore)   try_bore ;;
+            pinggy) try_pinggy ;;
+            serveo) try_serveo ;;
+            frp)    try_frp ;;
+            playit) try_playit ;;
+            auto)
+              try_bore   && return 0; echo ">> bore failed, trying pinggy"
+              try_pinggy && return 0; echo ">> pinggy failed, trying serveo"
+              try_serveo && return 0; echo ">> serveo failed, trying frp"
+              try_frp    && return 0; echo ">> frp failed, trying playit"
+              try_playit && return 0
+              return 1 ;;
+          esac
+        }
+
+        # ---------- run, retrying up to 3 rounds ----------
+        OK=""
+        for round in 1 2 3; do
+          if [ "$PANEL" = "true" ]; then try_bore && { OK=1; break; }
+          else run_once && { OK=1; break; }
+          fi
+          echo ">> round $round failed, waiting 20s"; sleep 20
+        done
+
+        [ -n "$OK" ] || { echo "::error::no tunnel could be opened after 3 rounds"; exit 1; }
         echo "PUBLIC_ADDR=$ADDR" >> "$GITHUB_ENV"
         echo "Tunnel OK -> $ADDR"
 
     # ------------------------------------------------------------
-    # 2. Paper jar
+    # 2. Paper jar + EssentialsX
     # ------------------------------------------------------------
     - name: Download Paper 1.8.8 build 445
       run: |
@@ -249,6 +362,28 @@ jobs:
         [ -s paper.jar ] || { echo "::error::could not download a valid paper.jar"; exit 1; }
         ls -lh paper.jar
 
+    - name: Download EssentialsX
+      if: ${{ inputs.install_essentials }}
+      run: |
+        # newest EssentialsX that still supports 1.8.8 first, older ones as fallback
+        rm -f essentials.jar
+        for v in 2.20.1 2.19.7 2.18.2; do
+          for u in \
+            "https://github.com/EssentialsX/Essentials/releases/download/${v}/EssentialsX-${v}.jar" \
+            "https://repo.essentialsx.net/releases/net/essentialsx/EssentialsX/${v}/EssentialsX-${v}.jar"; do
+            echo "Trying $u"
+            if curl -fsSL --retry 3 -o essentials.jar "$u" && unzip -tq essentials.jar > /dev/null 2>&1; then
+              echo "EssentialsX $v downloaded"; break 2
+            fi
+            rm -f essentials.jar
+          done
+        done
+        if [ -s essentials.jar ]; then
+          ls -lh essentials.jar
+        else
+          echo "::warning::could not download EssentialsX, server will start without it"
+        fi
+
     # ------------------------------------------------------------
     # 3A. standalone mode
     # ------------------------------------------------------------
@@ -263,7 +398,8 @@ jobs:
       if: ${{ !inputs.with_panel }}
       run: |
         set -e
-        mkdir -p mc && cp paper.jar mc/paper.jar
+        mkdir -p mc/plugins && cp paper.jar mc/paper.jar
+        [ -s essentials.jar ] && cp essentials.jar mc/plugins/EssentialsX.jar || true
         # console input pipe, so we can send commands (op ...) to the server
         rm -f mc.in; mkfifo mc.in
         nohup sleep infinity <> mc.in > /dev/null 2>&1 &
@@ -273,13 +409,14 @@ jobs:
         echo "server-port=25565" >> server.properties
         nohup java -Xms512M -Xmx${MC_RAM}M -jar paper.jar nogui < ../mc.in > ../server.log 2>&1 &
         echo $! > ../paper.pid
-        for i in $(seq 1 90); do
+        for i in $(seq 1 180); do
           grep -q 'Done (' ../server.log && break
           kill -0 "$(cat ../paper.pid)" 2>/dev/null || { echo "::error::Paper died"; tail -n 50 ../server.log; exit 1; }
           sleep 2
         done
         grep -q 'Done (' ../server.log || { echo "::error::Paper did not finish starting"; tail -n 50 ../server.log; exit 1; }
         echo "Paper is up."
+        if grep -qi 'Essentials.*enabled\|Enabling Essentials' ../server.log; then echo "EssentialsX loaded."; elif [ -s ../essentials.jar ]; then echo "::warning::EssentialsX not detected in log"; grep -i essentials ../server.log || true; fi
 
         if [ -n "$OP_PLAYER" ]; then
           echo "op $OP_PLAYER" > ../mc.in
@@ -418,9 +555,11 @@ jobs:
           -d '{"short":"local","long":"Local"}' | jq -r '.attributes.id')
         [ "$LOC_ID" != "null" ] || { echo "::error::location failed"; exit 1; }
 
+        # node memory must be >= server memory, otherwise server creation is rejected
+        NODE_MEM=$((MC_RAM + 1024))
         NODE_ID=$(curl -s -X POST http://127.0.0.1/api/application/nodes "${H[@]}" -d "{
           \"name\":\"Local Node\",\"location_id\":$LOC_ID,\"fqdn\":\"$TUNNEL_HOST\",\"scheme\":\"http\",
-          \"behind_proxy\":false,\"memory\":4096,\"memory_overallocate\":0,\"disk\":20480,
+          \"behind_proxy\":false,\"memory\":$NODE_MEM,\"memory_overallocate\":0,\"disk\":20480,
           \"disk_overallocate\":0,\"upload_size\":100,\"daemon_sftp\":2022,\"daemon_listen\":$WINGS_PORT}" \
           | jq -r '.attributes.id')
         [ "$NODE_ID" != "null" ] || { echo "::error::node failed"; exit 1; }
@@ -440,6 +579,7 @@ jobs:
         PY
         sudo chmod 600 /etc/pterodactyl/config.yml
         sudo nohup /usr/local/bin/wings --config /etc/pterodactyl/config.yml > /tmp/wings.log 2>&1 &
+        CODE=""
         for i in $(seq 1 30); do
           CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:${WINGS_PORT}/api/system || true)
           if [ "$CODE" = "200" ] || [ "$CODE" = "401" ]; then break; fi
@@ -468,7 +608,7 @@ jobs:
           \"name\":\"Paper 1.8.8\",\"user\":1,\"node\":$NODE_ID,\"nest\":1,\"egg\":$EGG_ID,
           \"docker_image\":\"ghcr.io/parkervcp/yolks:java_8\",
           \"startup\":\"java -Xms128M -Xmx{{SERVER_MEMORY}}M -jar {{SERVER_JARFILE}}\",
-          \"environment\":{\"SERVER_JARFILE\":\"server.jar\",\"MC_VERSION\":\"1.8.8\",\"BUILD_NUMBER\":\"445\",\"DL_PATH\":\"\"},
+          \"environment\":{\"SERVER_JARFILE\":\"server.jar\",\"MINECRAFT_VERSION\":\"1.8.8\",\"MC_VERSION\":\"1.8.8\",\"BUILD_NUMBER\":\"445\",\"DL_PATH\":\"\"},
           \"limits\":{\"memory\":$MC_RAM,\"swap\":0,\"disk\":10240,\"io\":500,\"cpu\":200},
           \"feature_limits\":{\"databases\":0,\"backups\":0,\"allocations\":1},
           \"allocation\":{\"default\":$ALLOC_ID},\"skip_scripts\":true,\"start_on_completion\":false}")
@@ -483,7 +623,13 @@ jobs:
         sudo cp paper.jar "$DIR/server.jar"
         echo "eula=true" | sudo tee "$DIR/eula.txt" > /dev/null
         echo "online-mode=${{ inputs.online_mode }}" | sudo tee "$DIR/server.properties" > /dev/null
-        sudo chown -R --reference="$DIR" "$DIR/server.jar" "$DIR/eula.txt" "$DIR/server.properties" 2>/dev/null || true
+        FILES=("$DIR/server.jar" "$DIR/eula.txt" "$DIR/server.properties")
+        if [ -s essentials.jar ]; then
+          sudo mkdir -p "$DIR/plugins"
+          sudo cp essentials.jar "$DIR/plugins/EssentialsX.jar"
+          FILES+=("$DIR/plugins" "$DIR/plugins/EssentialsX.jar")
+        fi
+        sudo chown -R --reference="$DIR" "${FILES[@]}" 2>/dev/null || true
 
         CODE=""
         for i in $(seq 1 20); do
@@ -510,7 +656,7 @@ jobs:
           sleep 5
         done
         [ "$STATE" = "running" ] || { echo "::warning::server not running yet, could not OP $OP_PLAYER"; exit 0; }
-        sleep 45   # let Paper finish loading
+        sleep 60   # let Paper + plugins finish loading
         CODE=""
         for i in $(seq 1 10); do
           CODE=$(curl -s -o /tmp/cmd.json -w "%{http_code}" -X POST \
@@ -530,6 +676,7 @@ jobs:
         echo "========================================================="
         echo " MINECRAFT (1.8.8):  ${PUBLIC_ADDR}"
         [ -z "$OP_PLAYER" ] || echo " OP:                 ${OP_PLAYER}"
+        [ ! -s essentials.jar ] || echo " PLUGINS:            EssentialsX"
         if [ "${{ inputs.with_panel }}" = "true" ]; then
           echo " PANEL:              http://${TUNNEL_HOST}:${PANEL_PORT}"
           echo " LOGIN:              admin@example.com / ${PANEL_PASS}"
@@ -538,27 +685,23 @@ jobs:
 
     - name: Keep alive (watchdog)
       run: |
-        LAST=""; LASTP=""
+        LAST=""
         while true; do
           if [ "${{ inputs.with_panel }}" != "true" ] && ! kill -0 "$(cat paper.pid)" 2>/dev/null; then
             echo "$(date -u) Paper stopped. Last log:"; tail -n 30 server.log
             exit 1
           fi
-          # pinggy reconnects (free tunnels time out) and can change address: print it when it changes
+          # pinggy/serveo reconnect and can change address: print it whenever it changes
+          CUR=""
           if [ -f /tmp/pinggy.log ]; then
             CUR=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/pinggy.log | grep -oE 'tcp://[A-Za-z0-9.-]+:[0-9]{2,5}' | tail -1 | sed 's#tcp://##' || true)
-            if [ -n "$CUR" ] && [ "$CUR" != "$LAST" ]; then
-              echo "$(date -u) CURRENT MINECRAFT ADDRESS: $CUR"
-              LAST="$CUR"
-            fi
           fi
-          # playit: show claim link / address lines from the agent log
-          if [ -f /tmp/playit.log ]; then
-            P=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/playit.log | grep -oE 'https://playit\.gg/[^ ]+|[A-Za-z0-9.-]+\.(joinmc\.link|ply\.gg)(:[0-9]+)?' | sort -u | tr '\n' ' ' || true)
-            if [ -n "$P" ] && [ "$P" != "$LASTP" ]; then
-              echo "$(date -u) PLAYIT INFO: $P"
-              LASTP="$P"
-            fi
+          if [ -z "$CUR" ] && [ -f /tmp/serveo.log ]; then
+            CUR=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/serveo.log | grep -oE 'serveo\.net:[0-9]{2,5}' | tail -1 || true)
+          fi
+          if [ -n "$CUR" ] && [ "$CUR" != "$LAST" ]; then
+            echo "$(date -u) CURRENT MINECRAFT ADDRESS: $CUR"
+            LAST="$CUR"
           fi
           sleep 30
         done
