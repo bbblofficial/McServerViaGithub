@@ -20,9 +20,9 @@ on:
         type: string
         default: "muvixo"
       tunnel:
-        description: "auto = bore > pinggy > serveo > frp > playit (retried 3x) | or force one. Panel needs bore or auto. frp/playit need repo secrets (see comments)."
+        description: "auto = bore > pinggy > serveo > playit (retried 3x) | or force one. Panel needs bore or auto. playit needs a repo secret (see comments)."
         type: choice
-        options: [auto, bore, pinggy, serveo, frp, playit]
+        options: [auto, bore, pinggy, serveo, playit]
         default: auto
       bore_server:
         description: "bore server (bore.pub is the public one; you can self-host your own `bore server`)"
@@ -52,12 +52,7 @@ env:
   OP_PLAYER: ${{ inputs.op_player }}
   BORE_HOST: ${{ inputs.bore_server }}
   # Optional repository secrets (Settings > Secrets and variables > Actions):
-  #   FRP_SERVER, FRP_TOKEN, FRP_SERVER_PORT (default 7000), FRP_REMOTE_PORT (default 25565)  -> your own frps server
-  #   PLAYIT_SECRET                                                                           -> playit.gg agent secret
-  FRP_SERVER: ${{ secrets.FRP_SERVER }}
-  FRP_TOKEN: ${{ secrets.FRP_TOKEN }}
-  FRP_SERVER_PORT: ${{ secrets.FRP_SERVER_PORT }}
-  FRP_REMOTE_PORT: ${{ secrets.FRP_REMOTE_PORT }}
+  #   PLAYIT_SECRET  -> playit.gg agent secret
   PLAYIT_SECRET: ${{ secrets.PLAYIT_SECRET }}
 
 jobs:
@@ -92,7 +87,7 @@ jobs:
         echo "Firewall opened."
 
     # ------------------------------------------------------------
-    # 1. public TCP tunnel (bore / pinggy / serveo / frp / playit / auto)
+    # 1. public TCP tunnel (bore / pinggy / serveo / playit / auto)
     # ------------------------------------------------------------
     - name: Start tunnel
       run: |
@@ -239,40 +234,6 @@ jobs:
           return 1
         }
 
-        # ---------- frp (needs your own frps server + secrets) ----------
-        try_frp() {
-          local i V=0.61.1 RP="${FRP_REMOTE_PORT:-25565}" SP="${FRP_SERVER_PORT:-7000}"
-          if [ -z "$FRP_SERVER" ] || [ -z "$FRP_TOKEN" ]; then
-            echo "frp: secrets FRP_SERVER / FRP_TOKEN not set, skipping"; return 1
-          fi
-          if [ ! -x ./frpc ]; then
-            curl -fsSL "https://github.com/fatedier/frp/releases/download/v${V}/frp_${V}_linux_amd64.tar.gz" | tar xz || return 1
-            cp "frp_${V}_linux_amd64/frpc" ./frpc && chmod +x frpc
-          fi
-          echo "::add-mask::$FRP_TOKEN"
-          {
-            echo "serverAddr = \"$FRP_SERVER\""
-            echo "serverPort = $SP"
-            echo "auth.token = \"$FRP_TOKEN\""
-            echo "[[proxies]]"
-            echo "name = \"minecraft\""
-            echo "type = \"tcp\""
-            echo "localIP = \"127.0.0.1\""
-            echo "localPort = 25565"
-            echo "remotePort = $RP"
-          } > frpc.toml
-          : > /tmp/frp.log
-          nohup ./generic_sup.sh /tmp/frp.log ./frpc -c frpc.toml > /dev/null 2>&1 &
-          for i in $(seq 1 30); do
-            if grep -q "start proxy success" /tmp/frp.log; then ADDR="$FRP_SERVER:$RP"; return 0; fi
-            sleep 1
-          done
-          echo "frp: failed. Log:"; cat /tmp/frp.log || true
-          pkill -f generic_sup.sh 2>/dev/null || true
-          pkill -f frpc 2>/dev/null || true
-          return 1
-        }
-
         # ---------- playit.gg (open source agent, needs PLAYIT_SECRET + a tunnel set to 25565 in the dashboard) ----------
         try_playit() {
           local i
@@ -303,13 +264,11 @@ jobs:
             bore)   try_bore ;;
             pinggy) try_pinggy ;;
             serveo) try_serveo ;;
-            frp)    try_frp ;;
             playit) try_playit ;;
             auto)
               try_bore   && return 0; echo ">> bore failed, trying pinggy"
               try_pinggy && return 0; echo ">> pinggy failed, trying serveo"
-              try_serveo && return 0; echo ">> serveo failed, trying frp"
-              try_frp    && return 0; echo ">> frp failed, trying playit"
+              try_serveo && return 0; echo ">> serveo failed, trying playit"
               try_playit && return 0
               return 1 ;;
           esac
