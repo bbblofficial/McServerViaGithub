@@ -272,7 +272,8 @@ jobs:
           set -e
           # Modify the JSON config so Wings listens locally on 8080 (which Cloudflare proxies to)
           # but continues communicating with the panel via localhost
-          jq '.api.port = 8080 | .api.host = "0.0.0.0" | .remote = "http://127.0.0.1"' /tmp/wings-config.json \
+          # FIX: We explicitly set allowed_origins to "*" to prevent CORS 403 Websocket handshake errors
+          jq '.api.port = 8080 | .api.host = "0.0.0.0" | .remote = "http://127.0.0.1" | .api.allowed_origins = ["*"]' /tmp/wings-config.json \
             | sudo tee /etc/pterodactyl/config.yml > /dev/null
             
           sudo mkdir -p /var/lib/pterodactyl/volumes
