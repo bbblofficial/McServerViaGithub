@@ -70,30 +70,39 @@ jobs:
           sudo apt-get install -y expect
           cat << 'EOF' > install_panel.exp
           set timeout 1800
-          spawn sudo bash -c "curl -s https://raw.githubusercontent.com/pterodactyl-installer/pterodactyl-installer/master/install.sh > install.sh && bash install.sh"
+          log_user 1
+          log_file -a /tmp/install_panel.log
+
+          spawn sudo bash -c "curl -s https://raw.githubusercontent.com/pterodactyl-installer/pterodactyl-installer/master/install.sh > /tmp/install.sh && bash /tmp/install.sh"
+
           expect {
-              timeout { puts "ERROR: expect timed out waiting for Pterodactyl installer prompt"; exit 1 }
-              -re {Input 0-6:}                                                   { send "0\r"; exp_continue }
-              -re {Database name \(panel\):}                                     { send "\r"; exp_continue }
-              -re {Database username \(pterodactyl\):}                           { send "\r"; exp_continue }
-              -re {Password \(press enter to use randomly generated password\):} { send "\r"; exp_continue }
-              -re {Select timezone \[.*\]:}                                      { send "UTC\r"; exp_continue }
-              -re {email address that will be used to configure}                 { send "admin@example.com\r"; exp_continue }
-              -re {Email address for the initial admin account:}                 { send "admin@example.com\r"; exp_continue }
-              -re {Username for the initial admin account:}                      { send "admin\r"; exp_continue }
-              -re {First name for the initial admin account:}                    { send "Admin\r"; exp_continue }
-              -re {Last name for the initial admin account:}                     { send "User\r"; exp_continue }
-              -re {Password for the initial admin account:}                      { send "AdminPassword123!\r"; exp_continue }
-              -re {Set the FQDN of this panel}                                   { send "127.0.0.1\r"; exp_continue }
-              -re {configure UFW.*\(y/N\)}                                       { send "N\r"; exp_continue }
-              -re {configure HTTPS using Let's Encrypt.*\(y/N\)}                 { send "N\r"; exp_continue }
-              -re {[Tt]elemetry[^:]*\(y/N\)}                                     { send "N\r"; exp_continue }
-              -re {[Tt]elemetry.*\?.*}                                           { send "N\r"; exp_continue }
-              -re {Continue with installation.*\(y/N\)}                          { send "y\r"; exp_continue }
+              timeout { puts "TIMEOUT: no matching prompt"; exit 1 }
+              -re {Input 0-6:}                                                    { send "0\r"; exp_continue }
+              -re {Database name \(panel\):}                                      { send "\r"; exp_continue }
+              -re {Database username \(pterodactyl\):}                            { send "\r"; exp_continue }
+              -re {Password \(press enter to use randomly generated password\):}  { send "\r"; exp_continue }
+              -re {Select timezone \[[^\]]*\]:}                                   { send "UTC\r"; exp_continue }
+              -re {Provide the email address that will be used to configure}      { send "admin@example.com\r"; exp_continue }
+              -re {Email address for the initial admin account:}                  { send "admin@example.com\r"; exp_continue }
+              -re {Username for the initial admin account:}                       { send "admin\r"; exp_continue }
+              -re {First name for the initial admin account:}                     { send "Admin\r"; exp_continue }
+              -re {Last name for the initial admin account:}                      { send "User\r"; exp_continue }
+              -re {Password for the initial admin account:}                       { send "AdminPassword123!\r"; exp_continue }
+              -re {Set the FQDN of this panel}                                    { send "127.0.0.1\r"; exp_continue }
+              -re {configure UFW \(firewall\)\? \(y/N\):}                         { send "N\r"; exp_continue }
+              -re {anonymous telemetry data\? \(yes/no\) \[yes\]:}                { send "no\r"; exp_continue }
+              -re {Continue with installation\? \(y/N\):}                         { send "y\r"; exp_continue }
               eof
           }
           EOF
           expect install_panel.exp
+
+          # Sanity check that the install actually happened
+          if [ ! -d /var/www/pterodactyl ]; then
+            echo "ERROR: /var/www/pterodactyl does not exist - installation failed."
+            tail -n 100 /tmp/install_panel.log || true
+            exit 1
+          fi
 
       - name: Start Cloudflare Quick Tunnel for Pterodactyl Panel
         run: |
